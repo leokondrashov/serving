@@ -184,7 +184,7 @@ func newRevisionThrottler(revID types.NamespacedName,
 	case containerConcurrency <= 3:
 		// For very low CC values use first available pod.
 		revBreaker = queue.NewBreaker(breakerParams)
-		lbp = firstAvailableLBPolicy
+		lbp = newRoundRobinPolicy()
 	default:
 		// Otherwise RR.
 		revBreaker = queue.NewBreaker(breakerParams)
