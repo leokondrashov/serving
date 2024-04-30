@@ -34,9 +34,9 @@ const (
 	// BucketSize is the size of the buckets of stats we create.
 	// NB: if this is more than 1s, we need to average values in the
 	// metrics buckets.
-	BucketSize = 1 * time.Second
+	BucketSize = 100 * time.Millisecond
 
-	defaultTargetUtilization = 0.7
+	defaultTargetUtilization = 1
 )
 
 func defaultConfig() *autoscalerconfig.Config {

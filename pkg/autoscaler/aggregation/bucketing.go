@@ -18,6 +18,7 @@ package aggregation
 
 import (
 	"math"
+	"slices"
 	"sync"
 	"time"
 
@@ -202,29 +203,23 @@ func (t *TimedFloat64Buckets) WindowAverage(now time.Time) float64 {
 	now = now.Truncate(t.granularity)
 	t.bucketsMutex.RLock()
 	defer t.bucketsMutex.RUnlock()
+	// Make it max instead
 	switch d := now.Sub(t.lastWrite); {
 	case d <= 0:
 		// If LastWrite equal or greater than Now
 		// return the current WindowTotal, divided by the
 		// number of valid buckets
-		numB := math.Min(
-			float64(t.lastWrite.Sub(t.firstWrite)/t.granularity)+1, // +1 since the times are inclusive.
-			float64(len(t.buckets)))
-		return roundToNDigits(precision, t.windowTotal/numB)
+		return slices.Max(t.buckets)
 	case d < t.window:
 		// If we haven't received metrics for some time, which is less than
 		// the window -- remove the outdated items and divide by the number
 		// of valid buckets
 		stIdx := t.timeToIndex(t.lastWrite)
 		eIdx := t.timeToIndex(now)
-		ret := t.windowTotal
 		for i := stIdx + 1; i <= eIdx; i++ {
-			ret -= t.buckets[i%len(t.buckets)]
+			t.buckets[i%len(t.buckets)] = 0
 		}
-		numB := math.Min(
-			float64(t.lastWrite.Sub(t.firstWrite)/t.granularity)+1, // +1 since the times are inclusive.
-			float64(len(t.buckets)-(eIdx-stIdx)))
-		return roundToNDigits(precision, ret/numB)
+		return slices.Max(t.buckets)
 	default: // Nothing for more than a window time, just 0.
 		return 0.
 	}
@@ -237,7 +232,7 @@ func (t *TimedFloat64Buckets) timeToIndex(tm time.Time) int {
 	// I don't think this run in 2038 :-)
 	// NB: we need to divide by granularity, since it's a compressing mapping
 	// to buckets.
-	return int(tm.Unix()) / int(t.granularity.Seconds())
+	return int(tm.Unix()*1000) / int(t.granularity.Milliseconds())
 }
 
 // Record adds a value with an associated time to the correct bucket.
