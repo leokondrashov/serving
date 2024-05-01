@@ -76,6 +76,7 @@ type RequestStatsReport struct {
 	// 2 requests each taking 500ms over a 1s reporting window generate an average
 	// concurrency of 1.
 	AverageConcurrency float64
+	Concurrency        float64
 	// AverageProxiedConcurrency is the average concurrency of all proxied requests.
 	// The same calculation as above applies.
 	AverageProxiedConcurrency float64
@@ -143,6 +144,7 @@ func (s *RequestStats) Report(now time.Time) RequestStatsReport {
 
 	if s.secondsInUse > 0 {
 		report.AverageConcurrency = s.computedConcurrency / s.secondsInUse
+		report.Concurrency = s.concurrency
 		report.AverageProxiedConcurrency = s.computedProxiedConcurrency / s.secondsInUse
 	}
 
