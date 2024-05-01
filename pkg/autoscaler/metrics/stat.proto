@@ -27,21 +27,24 @@ message Stat {
   // Average number of requests currently being handled by this pod.
   double average_concurrent_requests = 2;
 
+  // Number of requests currently being handled by this pod.
+  double concurrent_requests = 3;
+
   // Part of AverageConcurrentRequests, for requests going through a proxy.
-  double average_proxied_concurrent_requests = 3;
+  double average_proxied_concurrent_requests = 4;
 
   // Number of requests received since last Stat (approximately requests per second).
-  double request_count = 4;
+  double request_count = 5;
 
   // Part of RequestCount, for requests going through a proxy.
-  double proxied_request_count = 5;
+  double proxied_request_count = 6;
 
   // Process uptime in seconds.
-  double process_uptime = 6;
+  double process_uptime = 7;
 
   // Time/date that the stat was generated in seconds since
   // 1970-01-01 00:00:00.000 UTC.
-  int64 timestamp = 7;
+  int64 timestamp = 8;
 }
 
 // WireStatMessage is a copy of the StatMessage Golang type, exploding the fields of
