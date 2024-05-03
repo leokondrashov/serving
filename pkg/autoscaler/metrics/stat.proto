@@ -28,7 +28,7 @@ message Stat {
   double average_concurrent_requests = 2;
 
   // Number of requests currently being handled by this pod.
-  double concurrent_requests = 3;
+  int32 concurrent_requests = 3;
 
   // Part of AverageConcurrentRequests, for requests going through a proxy.
   double average_proxied_concurrent_requests = 4;
