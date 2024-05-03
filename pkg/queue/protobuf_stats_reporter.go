@@ -70,6 +70,7 @@ func (r *ProtobufStatsReporter) Report(stats netstats.RequestStatsReport) {
 		// RequestCount and ProxiedRequestCount are a rate over time while concurrency is not.
 		RequestCount:                     stats.RequestCount / r.reportingPeriodSeconds,
 		ProxiedRequestCount:              stats.ProxiedRequestCount / r.reportingPeriodSeconds,
+		ConcurrentRequests:               stats.Concurrency,
 		AverageConcurrentRequests:        stats.AverageConcurrency,
 		AverageProxiedConcurrentRequests: stats.AverageProxiedConcurrency,
 	})

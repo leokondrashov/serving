@@ -18,6 +18,7 @@ package aggregation
 
 import (
 	"math"
+	"slices"
 	"sync"
 	"time"
 
@@ -68,6 +69,33 @@ type (
 		// and is bounded by minExponent below.
 		smoothingCoeff float64
 	}
+
+	MaxingFloat64Buckets struct {
+		bucketsMutex sync.RWMutex
+		// buckets is a ring buffer indexed by timeToIndex() % len(buckets).
+		// Each element represents a certain granularity of time, and the total
+		// represented duration adds up to a window length of time.
+		buckets []float64
+
+		// firstWrite holds the time when the first write has been made.
+		// This time is reset to `now` when the very first write happens,
+		// or when a first write happens after `window` time of inactivity.
+		// The difference between `now` and `firstWrite` is used to compute
+		// the number of eligible buckets for computation of average values.
+		firstWrite time.Time
+
+		// lastWrite stores the time when the last write was made.
+		// This is used to detect when we have gaps in the data (i.e. more than a
+		// granularity has expired since the last write) so that we can zero those
+		// entries in the buckets array. It is also used when calculating the
+		// WindowAverage to know how much of the buckets array represents valid data.
+		lastWrite time.Time
+
+		// granularity is the duration represented by each bucket in the buckets ring buffer.
+		granularity time.Duration
+		// window is the total time represented by the buckets ring buffer.
+		window time.Duration
+	}
 )
 
 // String implements the Stringer interface.
@@ -102,6 +130,19 @@ func NewTimedFloat64Buckets(window, granularity time.Duration) *TimedFloat64Buck
 	}
 }
 
+// NewMaxingFloat64Buckets generates a new MaxingFloat64Buckets with the given
+// granularity.
+func NewMaxingFloat64Buckets(window, granularity time.Duration) *MaxingFloat64Buckets {
+	// Number of buckets is `window` divided by `granularity`, rounded up.
+	// e.g. 60s / 2s = 30.
+	nb := math.Ceil(float64(window) / float64(granularity))
+	return &MaxingFloat64Buckets{
+		buckets:     make([]float64, int(nb)),
+		granularity: granularity,
+		window:      window,
+	}
+}
+
 // NewWeightedFloat64Buckets generates a new WeightedFloat64Buckets with the given
 // granularity.
 func NewWeightedFloat64Buckets(window, granularity time.Duration) *WeightedFloat64Buckets {
@@ -122,8 +163,21 @@ func (t *TimedFloat64Buckets) IsEmpty(now time.Time) bool {
 	return t.isEmptyLocked(now)
 }
 
+// IsEmpty returns true if no data has been recorded for the `window` period.
+func (t *MaxingFloat64Buckets) IsEmpty(now time.Time) bool {
+	now = now.Truncate(t.granularity)
+	t.bucketsMutex.RLock()
+	defer t.bucketsMutex.RUnlock()
+	return t.isEmptyLocked(now)
+}
+
 // isEmptyLocked expects `now` to be truncated and at least Read Lock held.
 func (t *TimedFloat64Buckets) isEmptyLocked(now time.Time) bool {
+	return now.Sub(t.lastWrite) > t.window
+}
+
+// isEmptyLocked expects `now` to be truncated and at least Read Lock held.
+func (t *MaxingFloat64Buckets) isEmptyLocked(now time.Time) bool {
 	return now.Sub(t.lastWrite) > t.window
 }
 
@@ -230,10 +284,45 @@ func (t *TimedFloat64Buckets) WindowAverage(now time.Time) float64 {
 	}
 }
 
+func (t *MaxingFloat64Buckets) WindowAverage(now time.Time) float64 {
+	now = now.Truncate(t.granularity)
+	t.bucketsMutex.RLock()
+	defer t.bucketsMutex.RUnlock()
+	switch d := now.Sub(t.lastWrite); {
+	case d <= 0:
+		// If LastWrite equal or greater than Now
+		// return the max
+		return slices.Max(t.buckets)
+	case d < t.window:
+		// If we haven't received metrics for some time, which is less than
+		// the window -- max only over the valid buckets
+		stIdx := t.timeToIndex(now.Add(-t.window))
+		eIdx := t.timeToIndex(t.lastWrite)
+		ret := 0.
+		for i := stIdx + 1; i <= eIdx; i++ {
+			ret = max(ret, t.buckets[i%len(t.buckets)])
+		}
+		return ret
+	default: // Nothing for more than a window time, just 0.
+		return 0.
+	}
+
+}
+
 // timeToIndex converts time to an integer that can be used for modulo
 // operations to find the index in the bucket list.
 // bucketMutex needs to be held.
 func (t *TimedFloat64Buckets) timeToIndex(tm time.Time) int {
+	// I don't think this run in 2038 :-)
+	// NB: we need to divide by granularity, since it's a compressing mapping
+	// to buckets.
+	return int(tm.Unix()) / int(t.granularity.Seconds())
+}
+
+// timeToIndex converts time to an integer that can be used for modulo
+// operations to find the index in the bucket list.
+// bucketMutex needs to be held.
+func (t *MaxingFloat64Buckets) timeToIndex(tm time.Time) int {
 	// I don't think this run in 2038 :-)
 	// NB: we need to divide by granularity, since it's a compressing mapping
 	// to buckets.
@@ -296,6 +385,53 @@ func (t *TimedFloat64Buckets) Record(now time.Time, value float64) {
 	t.windowTotal += value
 }
 
+func (t *MaxingFloat64Buckets) Record(now time.Time, value float64) {
+	bucketTime := now.Truncate(t.granularity)
+
+	t.bucketsMutex.Lock()
+	defer t.bucketsMutex.Unlock()
+
+	writeIdx := t.timeToIndex(now)
+
+	if t.lastWrite != bucketTime {
+		if bucketTime.Add(t.window).After(t.lastWrite) {
+			// If it is the first write or it happened before the first write which we
+			// have in record, update the firstWrite.
+			if t.firstWrite.IsZero() || t.firstWrite.After(bucketTime) {
+				t.firstWrite = bucketTime
+			}
+
+			if bucketTime.After(t.lastWrite) {
+				if bucketTime.Sub(t.lastWrite) >= t.window {
+					// This means we had no writes for the duration of `window`. So reset the firstWrite time.
+					t.firstWrite = bucketTime
+					// Reset all the buckets.
+					for i := range t.buckets {
+						t.buckets[i] = 0
+					}
+				} else {
+					// In theory we might lose buckets between stats gathering.
+					// Thus we need to clean not only the current index, but also
+					// all the ones from the last write. This is slower than the loop above
+					// due to possible wrap-around, so they are not merged together.
+					for i := t.timeToIndex(t.lastWrite) + 1; i <= writeIdx; i++ {
+						idx := i % len(t.buckets)
+						t.buckets[idx] = 0
+					}
+				}
+				// Update the last write time.
+				t.lastWrite = bucketTime
+			}
+			// The else case is t.lastWrite - t.window < bucketTime < t.lastWrite, we can simply add
+			// the value to the bucket.
+		} else {
+			// Ignore this value because it happened a window size ago.
+			return
+		}
+	}
+	t.buckets[writeIdx%len(t.buckets)] = math.Max(value, t.buckets[writeIdx%len(t.buckets)])
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -356,4 +492,47 @@ func (t *TimedFloat64Buckets) ResizeWindow(w time.Duration) {
 	t.window = w
 	t.buckets = newBuckets
 	t.windowTotal = newTotal
+}
+
+// ResizeWindow resizes the window. This is an O(N) operation,
+// and is not supposed to be executed very often.
+func (t *MaxingFloat64Buckets) ResizeWindow(w time.Duration) {
+	// Same window size, bail out.
+	sameWindow := func() bool {
+		t.bucketsMutex.RLock()
+		defer t.bucketsMutex.RUnlock()
+		return w == t.window
+	}()
+	if sameWindow {
+		return
+	}
+	numBuckets := int(math.Ceil(float64(w) / float64(t.granularity)))
+	newBuckets := make([]float64, numBuckets)
+
+	// We need write lock here.
+	// So that we can copy the existing buckets into the new array.
+	t.bucketsMutex.Lock()
+	defer t.bucketsMutex.Unlock()
+	// If we had written any data within `window` time, then exercise the O(N)
+	// copy algorithm. Otherwise, just assign zeroes.
+	if time.Now().Truncate(t.granularity).Sub(t.lastWrite) <= t.window {
+		// If the window is shrinking, then we need to copy only
+		// `newBuckets` buckets.
+		oldNumBuckets := len(t.buckets)
+		tIdx := t.timeToIndex(t.lastWrite)
+		for i := 0; i < min(numBuckets, oldNumBuckets); i++ {
+			oi := tIdx % oldNumBuckets
+			ni := tIdx % numBuckets
+			newBuckets[ni] = t.buckets[oi]
+			tIdx--
+		}
+		// We can reset this as well to the earliest well known time when we might have
+		// written data, if it is
+		t.firstWrite = t.lastWrite.Add(-time.Duration(oldNumBuckets-1) * t.granularity)
+	} else {
+		// No valid data so far, so reset to initial value.
+		t.firstWrite = time.Time{}
+	}
+	t.window = w
+	t.buckets = newBuckets
 }

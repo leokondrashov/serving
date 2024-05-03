@@ -353,7 +353,8 @@ func (m *MultiScaler) Poke(key types.NamespacedName, stat metrics.Stat) {
 		return
 	}
 
-	if scaler.latestScale() == 0 && stat.AverageConcurrentRequests != 0 {
+	if scaler.latestScale() < stat.ConcurrentRequests {
+		m.logger.Debugf("Poking %s, current scale %d, concurrency %d", key, scaler.latestScale(), stat.ConcurrentRequests)
 		scaler.pokeCh <- struct{}{}
 	}
 }

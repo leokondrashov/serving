@@ -108,7 +108,16 @@ func (cr *ConcurrencyReporter) getOrCreateStat(event netstats.ReqEvent) (*revisi
 		// the deletion routine.
 		stat.refs.Inc()
 		cr.mux.RUnlock()
-		return stat, nil
+		report := stat.stats.Report(time.Now())
+		return stat, &asmetrics.StatMessage{
+			Key: event.Key,
+			Stat: asmetrics.Stat{
+				PodName:                   cr.podName,
+				AverageConcurrentRequests: report.AverageConcurrency,
+				ConcurrentRequests:        report.Concurrency,
+				RequestCount:              report.RequestCount,
+			},
+		}
 	}
 	cr.mux.RUnlock()
 
@@ -121,7 +130,16 @@ func (cr *ConcurrencyReporter) getOrCreateStat(event netstats.ReqEvent) (*revisi
 		// Since this is incremented under the lock, it's guaranteed to be observed by
 		// the deletion routine.
 		stat.refs.Inc()
-		return stat, nil
+		report := stat.stats.Report(time.Now())
+		return stat, &asmetrics.StatMessage{
+			Key: event.Key,
+			Stat: asmetrics.Stat{
+				PodName:                   cr.podName,
+				AverageConcurrentRequests: report.AverageConcurrency,
+				ConcurrentRequests:        report.Concurrency,
+				RequestCount:              report.RequestCount,
+			},
+		}
 	}
 
 	stat = &revisionStats{
@@ -136,6 +154,7 @@ func (cr *ConcurrencyReporter) getOrCreateStat(event netstats.ReqEvent) (*revisi
 		Stat: asmetrics.Stat{
 			PodName:                   cr.podName,
 			AverageConcurrentRequests: 1,
+			ConcurrentRequests:        1,
 			// The way the checks are written, this cannot ever be
 			// anything else but 1. The stats map key is only deleted
 			// after a reporting period, so we see this code path at most
@@ -192,6 +211,7 @@ func (cr *ConcurrencyReporter) computeReport(now time.Time) (msgs []asmetrics.St
 			Stat: asmetrics.Stat{
 				PodName:                   cr.podName,
 				AverageConcurrentRequests: adjustedConcurrency,
+				ConcurrentRequests:        report.Concurrency,
 				RequestCount:              adjustedCount,
 			},
 		})
