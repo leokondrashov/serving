@@ -268,7 +268,7 @@ func newCollection(metric *autoscalingv1alpha1.Metric, scraper StatsScraper, clo
 	// NB: this relies on the fact that aggregation algorithm is set on annotation of revision
 	// and as such is immutable.
 	bucketCtor := func(w time.Duration, g time.Duration) windowAverager {
-		return aggregation.NewTimedFloat64Buckets(w, g)
+		return aggregation.NewMaxingFloat64Buckets(w, g)
 	}
 	if metric.AggregationAlgorithm() == autoscaling.MetricAggregationAlgorithmWeightedExponential {
 		bucketCtor = func(w time.Duration, g time.Duration) windowAverager {
@@ -381,9 +381,8 @@ func (c *collection) lastError() error {
 func (c *collection) record(now time.Time, stat Stat) {
 	// Proxied requests have been counted at the activator. Subtract
 	// them to avoid double counting.
-	concur := stat.AverageConcurrentRequests - stat.AverageProxiedConcurrentRequests
-	c.concurrencyBuckets.Record(now, concur)
-	c.concurrencyPanicBuckets.Record(now, concur)
+	c.concurrencyBuckets.Record(now, float64(stat.ConcurrentRequests))
+	c.concurrencyPanicBuckets.Record(now, float64(stat.ConcurrentRequests))
 	rps := stat.RequestCount - stat.ProxiedRequestCount
 	c.rpsBuckets.Record(now, rps)
 	c.rpsPanicBuckets.Record(now, rps)
@@ -392,6 +391,7 @@ func (c *collection) record(now time.Time, stat Stat) {
 // add adds the stats from `src` to `dst`.
 func (dst *Stat) add(src Stat) {
 	dst.AverageConcurrentRequests += src.AverageConcurrentRequests
+	dst.ConcurrentRequests += src.ConcurrentRequests
 	dst.AverageProxiedConcurrentRequests += src.AverageProxiedConcurrentRequests
 	dst.RequestCount += src.RequestCount
 	dst.ProxiedRequestCount += src.ProxiedRequestCount
@@ -410,6 +410,7 @@ func (dst *Stat) add(src Stat) {
 // scraper.
 func (dst *Stat) average(sample, total float64) {
 	dst.AverageConcurrentRequests = dst.AverageConcurrentRequests / sample * total
+	dst.ConcurrentRequests = int32(float64(dst.ConcurrentRequests) / sample * total)
 	dst.AverageProxiedConcurrentRequests = dst.AverageProxiedConcurrentRequests / sample * total
 	dst.RequestCount = dst.RequestCount / sample * total
 	dst.ProxiedRequestCount = dst.ProxiedRequestCount / sample * total
