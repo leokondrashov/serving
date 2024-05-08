@@ -31,7 +31,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	corev1listers "k8s.io/client-go/listers/core/v1"
-	"k8s.io/client-go/rest"
 	kubeclient "knative.dev/pkg/client/injection/kube/client"
 
 	netcfg "knative.dev/networking/pkg/config"
@@ -84,8 +83,8 @@ func main() {
 	log.Printf("Registering %d controllers", controllerNum)
 
 	// Adjust our client's rate limits based on the number of controller's we are running.
-	cfg.QPS = controllerNum * rest.DefaultQPS
-	cfg.Burst = controllerNum * rest.DefaultBurst
+	// cfg.QPS = controllerNum * rest.DefaultQPS
+	// cfg.Burst = controllerNum * rest.DefaultBurst
 	ctx = filteredinformerfactory.WithSelectors(ctx, serving.RevisionUID)
 	ctx, informers := injection.Default.SetupInformers(ctx, cfg)
 
