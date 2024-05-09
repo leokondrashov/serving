@@ -232,6 +232,7 @@ type ControllerOptions struct { //nolint // for backcompat.
 	Reporter      StatsReporter
 	RateLimiter   workqueue.RateLimiter
 	Concurrency   int
+	Throttled     bool
 }
 
 // NewContext instantiates an instance of our controller that will feed work to the
@@ -246,13 +247,26 @@ func NewContext(ctx context.Context, r Reconciler, options ControllerOptions) *I
 	if options.Concurrency == 0 {
 		options.Concurrency = DefaultThreadsPerController
 	}
-	i := &Impl{
-		Name:          options.WorkQueueName,
-		Reconciler:    r,
-		workQueue:     newTwoLaneWorkQueue(options.WorkQueueName, options.RateLimiter),
-		logger:        options.Logger,
-		statsReporter: options.Reporter,
-		Concurrency:   options.Concurrency,
+
+	var i *Impl
+	if options.Throttled {
+		i = &Impl{
+			Name:          options.WorkQueueName,
+			Reconciler:    r,
+			workQueue:     newThrottledTwoLaneWorkQueue(options.WorkQueueName, options.RateLimiter),
+			logger:        options.Logger,
+			statsReporter: options.Reporter,
+			Concurrency:   options.Concurrency,
+		}
+	} else {
+		i = &Impl{
+			Name:          options.WorkQueueName,
+			Reconciler:    r,
+			workQueue:     newTwoLaneWorkQueue(options.WorkQueueName, options.RateLimiter),
+			logger:        options.Logger,
+			statsReporter: options.Reporter,
+			Concurrency:   options.Concurrency,
+		}
 	}
 
 	if t := GetTracker(ctx); t != nil {
