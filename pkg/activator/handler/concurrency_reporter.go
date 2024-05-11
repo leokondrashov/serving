@@ -83,10 +83,21 @@ func NewConcurrencyReporter(ctx context.Context, podName string, statCh chan []a
 // the outgoing event should be recorded to.
 func (cr *ConcurrencyReporter) handleRequestIn(event netstats.ReqEvent) *revisionStats {
 	stat, msg := cr.getOrCreateStat(event)
-	if msg != nil {
-		cr.statCh <- []asmetrics.StatMessage{*msg}
-	}
 	stat.stats.HandleEvent(event)
+	if msg == nil {
+		report := stat.stats.Report(time.Now())
+		msg = &asmetrics.StatMessage{
+			Key: event.Key,
+			Stat: asmetrics.Stat{
+				PodName:                   cr.podName,
+				AverageConcurrentRequests: report.AverageConcurrency,
+				ConcurrentRequests:        report.Concurrency,
+				RequestCount:              report.RequestCount,
+			},
+		}
+	}
+
+	cr.statCh <- []asmetrics.StatMessage{*msg}
 	return stat
 }
 
@@ -108,16 +119,8 @@ func (cr *ConcurrencyReporter) getOrCreateStat(event netstats.ReqEvent) (*revisi
 		// the deletion routine.
 		stat.refs.Inc()
 		cr.mux.RUnlock()
-		report := stat.stats.Report(time.Now())
-		return stat, &asmetrics.StatMessage{
-			Key: event.Key,
-			Stat: asmetrics.Stat{
-				PodName:                   cr.podName,
-				AverageConcurrentRequests: report.AverageConcurrency,
-				ConcurrentRequests:        report.Concurrency,
-				RequestCount:              report.RequestCount,
-			},
-		}
+
+		return stat, nil
 	}
 	cr.mux.RUnlock()
 
@@ -130,16 +133,7 @@ func (cr *ConcurrencyReporter) getOrCreateStat(event netstats.ReqEvent) (*revisi
 		// Since this is incremented under the lock, it's guaranteed to be observed by
 		// the deletion routine.
 		stat.refs.Inc()
-		report := stat.stats.Report(time.Now())
-		return stat, &asmetrics.StatMessage{
-			Key: event.Key,
-			Stat: asmetrics.Stat{
-				PodName:                   cr.podName,
-				AverageConcurrentRequests: report.AverageConcurrency,
-				ConcurrentRequests:        report.Concurrency,
-				RequestCount:              report.RequestCount,
-			},
-		}
+		return stat, nil
 	}
 
 	stat = &revisionStats{
