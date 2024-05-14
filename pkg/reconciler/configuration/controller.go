@@ -36,7 +36,7 @@ import (
 func NewController(
 	ctx context.Context,
 	cmw configmap.Watcher,
-) *controller.Impl {
+) controller.Impl {
 	logger := logging.FromContext(ctx)
 	configurationInformer := configurationinformer.Get(ctx)
 	revisionInformer := revisioninformer.Get(ctx)
@@ -49,7 +49,7 @@ func NewController(
 		revisionLister: revisionInformer.Lister(),
 		clock:          &clock.RealClock{},
 	}
-	impl := configreconciler.NewImpl(ctx, c, func(*controller.Impl) controller.Options {
+	impl := configreconciler.NewImpl(ctx, c, func(*controller.ImplStd) controller.Options {
 		return controller.Options{ConfigStore: configStore}
 	})
 

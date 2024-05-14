@@ -46,7 +46,7 @@ import (
 func NewController(
 	ctx context.Context,
 	cmw configmap.Watcher,
-) *controller.Impl {
+) controller.Impl {
 	return newController(ctx, cmw, clock.RealClock{})
 }
 
@@ -57,7 +57,7 @@ func newController(
 	cmw configmap.Watcher,
 	clock clock.Clock,
 	opts ...reconcilerOption,
-) *controller.Impl {
+) *controller.ImplStd {
 	logger := logging.FromContext(ctx)
 	serviceInformer := serviceinformer.Get(ctx)
 	endpointsInformer := endpointsinformer.Get(ctx)
@@ -79,7 +79,7 @@ func newController(
 		certificateLister:   certificateInformer.Lister(),
 		clock:               clock,
 	}
-	impl := routereconciler.NewImpl(ctx, c, func(impl *controller.Impl) controller.Options {
+	impl := routereconciler.NewImpl(ctx, c, func(impl *controller.ImplStd) controller.Options {
 		configsToResync := []interface{}{
 			&netcfg.Config{},
 			&config.Domain{},

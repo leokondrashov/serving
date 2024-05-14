@@ -33,7 +33,7 @@ import (
 	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	record "k8s.io/client-go/tools/record"
 	kubeclient "knative.dev/pkg/client/injection/kube/client"
-	controller "knative.dev/pkg/controller"
+	controller "knative.dev/serving/pkg/autoscaler/throttled_controller"
 	logging "knative.dev/pkg/logging"
 	logkey "knative.dev/pkg/logging/logkey"
 	reconciler "knative.dev/pkg/reconciler"
@@ -110,7 +110,7 @@ func NewImpl(ctx context.Context, r Interface, classValue string, optionsFns ...
 		zap.String(logkey.Kind, "autoscaling.internal.knative.dev.PodAutoscaler"),
 	)
 
-	impl := controller.NewContext(ctx, rec, controller.ControllerOptions{WorkQueueName: ctrTypeName, Logger: logger, Throttled: true})
+	impl := controller.NewContext(ctx, rec, controller.ControllerOptions{WorkQueueName: ctrTypeName, Logger: logger})
 	agentName := defaultControllerAgentName
 
 	// Pass impl to the options. Save any optional results.

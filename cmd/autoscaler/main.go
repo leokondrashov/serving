@@ -141,7 +141,7 @@ func main() {
 	multiScaler := scaling.NewMultiScaler(ctx.Done(),
 		uniScalerFactoryFunc(podLister, collector), logger)
 
-	controllers := []*controller.Impl{
+	controllers := []controller.Impl{
 		kpa.NewController(ctx, cmw, multiScaler),
 		metric.NewController(ctx, cmw, collector),
 	}

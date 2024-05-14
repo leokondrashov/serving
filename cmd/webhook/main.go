@@ -79,7 +79,7 @@ var callbacks = map[schema.GroupVersionKind]validation.Callback{
 	servingv1.SchemeGroupVersion.WithKind("Configuration"): configValidation,
 }
 
-func newDefaultingAdmissionController(ctx context.Context, cmw configmap.Watcher) *controller.Impl {
+func newDefaultingAdmissionController(ctx context.Context, cmw configmap.Watcher) controller.Impl {
 	// Decorate contexts with the current state of the config.
 	store := apisconfig.NewStore(logging.FromContext(ctx).Named("config-store"))
 	store.WatchConfigs(cmw)
@@ -104,7 +104,7 @@ func newDefaultingAdmissionController(ctx context.Context, cmw configmap.Watcher
 	)
 }
 
-func newValidationAdmissionController(ctx context.Context, cmw configmap.Watcher) *controller.Impl {
+func newValidationAdmissionController(ctx context.Context, cmw configmap.Watcher) controller.Impl {
 	// Decorate contexts with the current state of the config.
 	store := apisconfig.NewStore(logging.FromContext(ctx).Named("config-store"))
 	store.WatchConfigs(cmw)
@@ -132,7 +132,7 @@ func newValidationAdmissionController(ctx context.Context, cmw configmap.Watcher
 	)
 }
 
-func newConfigValidationController(ctx context.Context, cmw configmap.Watcher) *controller.Impl {
+func newConfigValidationController(ctx context.Context, cmw configmap.Watcher) controller.Impl {
 	return configmaps.NewAdmissionController(ctx,
 
 		// Name of the configmap webhook.

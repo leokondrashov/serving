@@ -116,11 +116,11 @@ func TestControllerCanReconcile(t *testing.T) {
 	fakepainformer.Get(ctx).Informer().GetIndexer().Add(podAutoscaler)
 
 	// The Reconciler won't do any work until it becomes the leader.
-	if la, ok := ctl.Reconciler.(reconciler.LeaderAware); ok {
+	if la, ok := ctl.GetReconciler().(reconciler.LeaderAware); ok {
 		la.Promote(reconciler.UniversalBucket(), func(reconciler.Bucket, types.NamespacedName) {})
 	}
 
-	err = ctl.Reconciler.Reconcile(ctx, testNamespace+"/"+testRevision)
+	err = ctl.GetReconciler().Reconcile(ctx, testNamespace+"/"+testRevision)
 	if err != nil {
 		t.Error("Reconcile() =", err)
 	}

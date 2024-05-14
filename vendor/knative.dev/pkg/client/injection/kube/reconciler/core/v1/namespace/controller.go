@@ -49,7 +49,7 @@ const (
 // the queue through an implementation of controller.Reconciler, delegating to
 // the provided Interface and optional Finalizer methods. OptionsFn is used to return
 // controller.ControllerOptions to be used by the internal reconciler.
-func NewImpl(ctx context.Context, r Interface, optionsFns ...controller.OptionsFn) *controller.Impl {
+func NewImpl(ctx context.Context, r Interface, optionsFns ...controller.OptionsFn) *controller.ImplStd {
 	logger := logging.FromContext(ctx)
 
 	// Check the options function input. It should be 0 or 1.

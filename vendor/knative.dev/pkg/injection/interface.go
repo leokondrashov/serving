@@ -78,7 +78,7 @@ type Interface interface {
 	SetupInformers(context.Context, *rest.Config) (context.Context, []controller.Informer)
 }
 
-type ControllerConstructor func(context.Context, configmap.Watcher) *controller.Impl
+type ControllerConstructor func(context.Context, configmap.Watcher) controller.Impl
 
 // NamedControllerConstructor is a ControllerConstructor with an associated name.
 type NamedControllerConstructor struct {

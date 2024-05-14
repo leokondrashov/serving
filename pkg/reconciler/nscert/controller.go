@@ -36,7 +36,7 @@ import (
 
 // NewController initializes the controller and is called by the generated code
 // Registers eventhandlers to enqueue events.
-func NewController(ctx context.Context, cmw configmap.Watcher) *controller.Impl {
+func NewController(ctx context.Context, cmw configmap.Watcher) controller.Impl {
 	logger := logging.FromContext(ctx)
 	nsInformer := nsinformer.Get(ctx)
 	knCertificateInformer := kcertinformer.Get(ctx)
@@ -46,7 +46,7 @@ func NewController(ctx context.Context, cmw configmap.Watcher) *controller.Impl 
 		knCertificateLister: knCertificateInformer.Lister(),
 	}
 
-	impl := namespacereconciler.NewImpl(ctx, c, func(impl *controller.Impl) controller.Options {
+	impl := namespacereconciler.NewImpl(ctx, c, func(impl *controller.ImplStd) controller.Options {
 		nsInformer.Informer().AddEventHandler(controller.HandleAll(impl.Enqueue))
 
 		knCertificateInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{

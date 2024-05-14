@@ -36,7 +36,7 @@ import (
 )
 
 // NewController creates a new DomainMapping controller.
-func NewController(ctx context.Context, cmw configmap.Watcher) *controller.Impl {
+func NewController(ctx context.Context, cmw configmap.Watcher) controller.Impl {
 	logger := logging.FromContext(ctx)
 	certificateInformer := certificateinformer.Get(ctx)
 	domainmappingInformer := domainmapping.Get(ctx)
@@ -50,7 +50,7 @@ func NewController(ctx context.Context, cmw configmap.Watcher) *controller.Impl 
 		netclient:         netclient.Get(ctx),
 	}
 
-	impl := kindreconciler.NewImpl(ctx, r, func(impl *controller.Impl) controller.Options {
+	impl := kindreconciler.NewImpl(ctx, r, func(impl *controller.ImplStd) controller.Options {
 		configsToResync := []interface{}{
 			&netcfg.Config{},
 		}

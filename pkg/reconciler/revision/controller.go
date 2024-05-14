@@ -57,7 +57,7 @@ const digestResolutionWorkers = 100
 func NewController(
 	ctx context.Context,
 	cmw configmap.Watcher,
-) *controller.Impl {
+) controller.Impl {
 	return newControllerWithOptions(ctx, cmw)
 }
 
@@ -67,7 +67,7 @@ func newControllerWithOptions(
 	ctx context.Context,
 	cmw configmap.Watcher,
 	opts ...reconcilerOption,
-) *controller.Impl {
+) *controller.ImplStd {
 	logger := logging.FromContext(ctx)
 	revisionInformer := revisioninformer.Get(ctx)
 	deploymentInformer := deploymentinformer.Get(ctx)
@@ -84,7 +84,7 @@ func newControllerWithOptions(
 		deploymentLister:    deploymentInformer.Lister(),
 	}
 
-	impl := revisionreconciler.NewImpl(ctx, c, func(impl *controller.Impl) controller.Options {
+	impl := revisionreconciler.NewImpl(ctx, c, func(impl *controller.ImplStd) controller.Options {
 		configsToResync := []interface{}{
 			&netcfg.Config{},
 			&metrics.ObservabilityConfig{},

@@ -451,27 +451,27 @@ func SecretFetcher(ctx context.Context) metrics.SecretFetcher {
 // of the webhooks created from the given constructors.
 func ControllersAndWebhooksFromCtors(ctx context.Context,
 	cmw *cminformer.InformedWatcher,
-	ctors ...injection.ControllerConstructor) ([]*controller.Impl, []interface{}) {
+	ctors ...injection.ControllerConstructor) ([]controller.Impl, []interface{}) {
 
 	// Check whether the context has been infused with a leader elector builder.
 	// If it has, then every reconciler we plan to start MUST implement LeaderAware.
 	leEnabled := leaderelection.HasLeaderElection(ctx)
 
-	controllers := make([]*controller.Impl, 0, len(ctors))
+	controllers := make([]controller.Impl, 0, len(ctors))
 	webhooks := make([]interface{}, 0)
 	for _, cf := range ctors {
 		ctrl := cf(ctx, cmw)
 		controllers = append(controllers, ctrl)
 
 		// Build a list of any reconcilers that implement webhook.AdmissionController
-		switch c := ctrl.Reconciler.(type) {
+		switch c := ctrl.GetReconciler().(type) {
 		case webhook.AdmissionController, webhook.ConversionController:
 			webhooks = append(webhooks, c)
 		}
 
 		if leEnabled {
-			if _, ok := ctrl.Reconciler.(reconciler.LeaderAware); !ok {
-				log.Fatalf("%T is not leader-aware, all reconcilers must be leader-aware to enable fine-grained leader election.", ctrl.Reconciler)
+			if _, ok := ctrl.GetReconciler().(reconciler.LeaderAware); !ok {
+				log.Fatalf("%T is not leader-aware, all reconcilers must be leader-aware to enable fine-grained leader election.", ctrl.GetReconciler())
 			}
 		}
 	}

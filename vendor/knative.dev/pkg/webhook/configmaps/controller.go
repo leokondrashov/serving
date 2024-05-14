@@ -40,7 +40,7 @@ func NewAdmissionController(
 	ctx context.Context,
 	name, path string,
 	constructors configmap.Constructors,
-) *controller.Impl {
+) *controller.ImplStd {
 
 	client := kubeclient.Get(ctx)
 	vwhInformer := vwhinformer.Get(ctx)

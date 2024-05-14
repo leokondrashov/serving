@@ -42,7 +42,7 @@ import (
 func NewController(
 	ctx context.Context,
 	cmw configmap.Watcher,
-) *controller.Impl {
+) controller.Impl {
 
 	logger := logging.FromContext(ctx)
 	serviceInformer := serviceinformer.Get(ctx)

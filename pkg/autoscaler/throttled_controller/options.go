@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package controller
+package throttled_controller
 
 import "knative.dev/pkg/reconciler"
 
@@ -55,4 +55,4 @@ type Options struct {
 // OptionsFn is a callback method signature that accepts an Impl and returns
 // Options. Used for controllers that need access to the members of Options but
 // to build Options, integrators need an Impl.
-type OptionsFn func(impl *ImplStd) Options
+type OptionsFn func(impl *Impl) Options

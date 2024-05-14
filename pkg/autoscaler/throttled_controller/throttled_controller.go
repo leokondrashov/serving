@@ -14,12 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package controller
+package throttled_controller
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +39,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 
+	"knative.dev/pkg/controller"
 	"knative.dev/pkg/kmeta"
 	kle "knative.dev/pkg/leaderelection"
 	"knative.dev/pkg/logging"
@@ -62,12 +65,6 @@ var (
 	// TODO rename the const to Concurrency and deprecated this
 	DefaultThreadsPerController = 2
 )
-
-// Reconciler is the interface that controller implementations are expected
-// to implement, so that the shared controller.Impl can drive work through it.
-type Reconciler interface {
-	Reconcile(ctx context.Context, key string) error
-}
 
 // PassNew makes it simple to create an UpdateFunc for use with
 // cache.ResourceEventHandlerFuncs that can delegate the same methods
@@ -186,25 +183,16 @@ func FilterWithNameAndNamespace(namespace, name string) func(obj interface{}) bo
 	}
 }
 
-type Impl interface {
-	Run(ctx context.Context) error
-	RunContext(ctx context.Context, threadiness int) error
-	GetReconciler() Reconciler
-	SetReconciler(r Reconciler)
-	MaybeEnqueueBucketKey(bkt reconciler.Bucket, key types.NamespacedName)
-	Enqueue(obj interface{})
-}
-
-// ImplStd is our core controller implementation.  It handles queuing and feeding work
+// Impl is our core controller implementation.  It handles queuing and feeding work
 // from the queue to an implementation of Reconciler.
-type ImplStd struct {
+type Impl struct {
 	// Name is the unique name for this controller workqueue within this process.
 	// This is used for surfacing metrics, and per-controller leader election.
 	Name string
 
 	// Reconciler is the workhorse of this controller, it is fed the keys
 	// from the workqueue to process.  Public for testing.
-	Reconciler Reconciler
+	Reconciler controller.Reconciler
 
 	// workQueue is a rate-limited two-lane work queue.
 	// This is used to queue work to be processed instead of performing it as
@@ -213,7 +201,7 @@ type ImplStd struct {
 	// never processing the same item simultaneously in two different workers.
 	// The slow queue is used for global resync and other background processes
 	// which are not required to complete at the highest priority.
-	workQueue *twoLaneQueue
+	workQueue *throttledTwoLaneQueue
 
 	// Concurrency - The number of workers to use when processing the controller's workqueue.
 	Concurrency int
@@ -226,7 +214,7 @@ type ImplStd struct {
 	logger *zap.SugaredLogger
 
 	// StatsReporter is used to send common controller metrics.
-	statsReporter StatsReporter
+	statsReporter controller.StatsReporter
 
 	// Tracker allows reconcilers to associate a reference with particular key,
 	// such that when the reference changes the key is queued for reconciliation.
@@ -238,27 +226,28 @@ type ImplStd struct {
 type ControllerOptions struct { //nolint // for backcompat.
 	WorkQueueName string
 	Logger        *zap.SugaredLogger
-	Reporter      StatsReporter
+	Reporter      controller.StatsReporter
 	RateLimiter   workqueue.RateLimiter
 	Concurrency   int
 }
 
 // NewContext instantiates an instance of our controller that will feed work to the
 // provided Reconciler as it is enqueued.
-func NewContext(ctx context.Context, r Reconciler, options ControllerOptions) *ImplStd {
+func NewContext(ctx context.Context, r controller.Reconciler, options ControllerOptions) *Impl {
 	if options.RateLimiter == nil {
 		options.RateLimiter = workqueue.DefaultControllerRateLimiter()
 	}
 	if options.Reporter == nil {
-		options.Reporter = MustNewStatsReporter(options.WorkQueueName, options.Logger)
+		options.Reporter = controller.MustNewStatsReporter(options.WorkQueueName, options.Logger)
 	}
 	if options.Concurrency == 0 {
 		options.Concurrency = DefaultThreadsPerController
 	}
-	i := &ImplStd{
+
+	i := &Impl{
 		Name:          options.WorkQueueName,
 		Reconciler:    r,
-		workQueue:     newTwoLaneWorkQueue(options.WorkQueueName, options.RateLimiter),
+		workQueue:     newThrottledTwoLaneWorkQueue(options.WorkQueueName, options.RateLimiter),
 		logger:        options.Logger,
 		statsReporter: options.Reporter,
 		Concurrency:   options.Concurrency,
@@ -273,22 +262,22 @@ func NewContext(ctx context.Context, r Reconciler, options ControllerOptions) *I
 	return i
 }
 
-func (c *ImplStd) GetReconciler() Reconciler {
+func (c *Impl) GetReconciler() controller.Reconciler {
 	return c.Reconciler
 }
 
-func (c *ImplStd) SetReconciler(r Reconciler) {
+func (c *Impl) SetReconciler(r controller.Reconciler) {
 	c.Reconciler = r
 }
 
 // WorkQueue permits direct access to the work queue.
-func (c *ImplStd) WorkQueue() workqueue.RateLimitingInterface {
+func (c *Impl) WorkQueue() workqueue.RateLimitingInterface {
 	return c.workQueue
 }
 
 // EnqueueAfter takes a resource, converts it into a namespace/name string,
 // and passes it to EnqueueKey.
-func (c *ImplStd) EnqueueAfter(obj interface{}, after time.Duration) {
+func (c *Impl) EnqueueAfter(obj interface{}, after time.Duration) {
 	object, err := kmeta.DeletionHandlingAccessor(obj)
 	if err != nil {
 		c.logger.Errorw("EnqueueAfter", zap.Error(err))
@@ -299,7 +288,7 @@ func (c *ImplStd) EnqueueAfter(obj interface{}, after time.Duration) {
 
 // EnqueueSlowKey takes a resource, converts it into a namespace/name string,
 // and enqueues that key in the slow lane.
-func (c *ImplStd) EnqueueSlowKey(key types.NamespacedName) {
+func (c *Impl) EnqueueSlowKey(key types.NamespacedName) {
 	c.workQueue.SlowLane().Add(key)
 
 	if logger := c.logger.Desugar(); logger.Core().Enabled(zapcore.DebugLevel) {
@@ -311,7 +300,7 @@ func (c *ImplStd) EnqueueSlowKey(key types.NamespacedName) {
 
 // EnqueueSlow extracts namespaced name from the object and enqueues it on the slow
 // work queue.
-func (c *ImplStd) EnqueueSlow(obj interface{}) {
+func (c *Impl) EnqueueSlow(obj interface{}) {
 	object, err := kmeta.DeletionHandlingAccessor(obj)
 	if err != nil {
 		c.logger.Errorw("EnqueueSlow", zap.Error(err))
@@ -323,7 +312,7 @@ func (c *ImplStd) EnqueueSlow(obj interface{}) {
 
 // Enqueue takes a resource, converts it into a namespace/name string,
 // and passes it to EnqueueKey.
-func (c *ImplStd) Enqueue(obj interface{}) {
+func (c *Impl) Enqueue(obj interface{}) {
 	object, err := kmeta.DeletionHandlingAccessor(obj)
 	if err != nil {
 		c.logger.Errorw("Enqueue", zap.Error(err))
@@ -334,7 +323,7 @@ func (c *ImplStd) Enqueue(obj interface{}) {
 
 // EnqueueSentinel returns a Enqueue method which will always enqueue a
 // predefined key instead of the object key.
-func (c *ImplStd) EnqueueSentinel(k types.NamespacedName) func(interface{}) {
+func (c *Impl) EnqueueSentinel(k types.NamespacedName) func(interface{}) {
 	return func(interface{}) {
 		c.EnqueueKey(k)
 	}
@@ -342,7 +331,7 @@ func (c *ImplStd) EnqueueSentinel(k types.NamespacedName) func(interface{}) {
 
 // EnqueueControllerOf takes a resource, identifies its controller resource,
 // converts it into a namespace/name string, and passes that to EnqueueKey.
-func (c *ImplStd) EnqueueControllerOf(obj interface{}) {
+func (c *Impl) EnqueueControllerOf(obj interface{}) {
 	object, err := kmeta.DeletionHandlingAccessor(obj)
 	if err != nil {
 		c.logger.Error(err)
@@ -360,7 +349,7 @@ func (c *ImplStd) EnqueueControllerOf(obj interface{}) {
 // takes a resource, identifies its controller resource through given namespace
 // and name labels, converts it into a namespace/name string, and passes that
 // to EnqueueKey. The controller resource must be of namespace-scoped.
-func (c *ImplStd) EnqueueLabelOfNamespaceScopedResource(namespaceLabel, nameLabel string) func(obj interface{}) {
+func (c *Impl) EnqueueLabelOfNamespaceScopedResource(namespaceLabel, nameLabel string) func(obj interface{}) {
 	return func(obj interface{}) {
 		object, err := kmeta.DeletionHandlingAccessor(obj)
 		if err != nil {
@@ -399,7 +388,7 @@ func (c *ImplStd) EnqueueLabelOfNamespaceScopedResource(namespaceLabel, nameLabe
 // that takes a resource, identifies its controller resource through
 // given name label, and passes it to EnqueueKey.
 // The controller resource must be of cluster-scoped.
-func (c *ImplStd) EnqueueLabelOfClusterScopedResource(nameLabel string) func(obj interface{}) {
+func (c *Impl) EnqueueLabelOfClusterScopedResource(nameLabel string) func(obj interface{}) {
 	return func(obj interface{}) {
 		object, err := kmeta.DeletionHandlingAccessor(obj)
 		if err != nil {
@@ -420,7 +409,7 @@ func (c *ImplStd) EnqueueLabelOfClusterScopedResource(nameLabel string) func(obj
 }
 
 // EnqueueNamespaceOf takes a resource, and enqueues the Namespace to which it belongs.
-func (c *ImplStd) EnqueueNamespaceOf(obj interface{}) {
+func (c *Impl) EnqueueNamespaceOf(obj interface{}) {
 	object, err := kmeta.DeletionHandlingAccessor(obj)
 	if err != nil {
 		c.logger.Errorw("EnqueueNamespaceOf", zap.Error(err))
@@ -430,7 +419,19 @@ func (c *ImplStd) EnqueueNamespaceOf(obj interface{}) {
 }
 
 // EnqueueKey takes a namespace/name string and puts it onto the work queue.
-func (c *ImplStd) EnqueueKey(key types.NamespacedName) {
+func (c *Impl) EnqueueKey(key types.NamespacedName) {
+	if key.Name != "" {
+		components := strings.Split(key.Name, "-")
+		if len(components) >= 3 {
+			thirdComponent := components[2]
+			num, err := strconv.Atoi(thirdComponent)
+			if err == nil && num%2 != 0 {
+				c.EnqueueSlowKey(key)
+				return
+			}
+		}
+	}
+
 	c.workQueue.Add(key)
 
 	if logger := c.logger.Desugar(); logger.Core().Enabled(zapcore.DebugLevel) {
@@ -441,7 +442,7 @@ func (c *ImplStd) EnqueueKey(key types.NamespacedName) {
 
 // MaybeEnqueueBucketKey takes a Bucket and namespace/name string and puts it onto
 // the slow work queue.
-func (c *ImplStd) MaybeEnqueueBucketKey(bkt reconciler.Bucket, key types.NamespacedName) {
+func (c *Impl) MaybeEnqueueBucketKey(bkt reconciler.Bucket, key types.NamespacedName) {
 	if bkt.Has(key) {
 		c.EnqueueSlowKey(key)
 	}
@@ -449,7 +450,7 @@ func (c *ImplStd) MaybeEnqueueBucketKey(bkt reconciler.Bucket, key types.Namespa
 
 // EnqueueKeyAfter takes a namespace/name string and schedules its execution in
 // the work queue after given delay.
-func (c *ImplStd) EnqueueKeyAfter(key types.NamespacedName, delay time.Duration) {
+func (c *Impl) EnqueueKeyAfter(key types.NamespacedName, delay time.Duration) {
 	c.workQueue.AddAfter(key, delay)
 
 	if logger := c.logger.Desugar(); logger.Core().Enabled(zapcore.DebugLevel) {
@@ -459,7 +460,7 @@ func (c *ImplStd) EnqueueKeyAfter(key types.NamespacedName, delay time.Duration)
 }
 
 // Run runs the controller with it's configured Concurrency
-func (c *ImplStd) Run(ctx context.Context) error {
+func (c *Impl) Run(ctx context.Context) error {
 	return c.RunContext(ctx, c.Concurrency)
 }
 
@@ -468,7 +469,7 @@ func (c *ImplStd) Run(ctx context.Context) error {
 // It then blocks until the context is cancelled, at which point it shuts down its
 // internal work queue and waits for workers to finish processing their current
 // work items.
-func (c *ImplStd) RunContext(ctx context.Context, threadiness int) error {
+func (c *Impl) RunContext(ctx context.Context, threadiness int) error {
 	sg := sync.WaitGroup{}
 	defer func() {
 		c.workQueue.ShutDown()
@@ -519,7 +520,7 @@ func (c *ImplStd) RunContext(ctx context.Context, threadiness int) error {
 
 // processNextWorkItem will read a single work item off the workqueue and
 // attempt to process it, by calling Reconcile on our Reconciler.
-func (c *ImplStd) processNextWorkItem() bool {
+func (c *Impl) processNextWorkItem() bool {
 	obj, shutdown := c.workQueue.Get()
 	if shutdown {
 		return false
@@ -569,7 +570,7 @@ func (c *ImplStd) processNextWorkItem() bool {
 	return true
 }
 
-func (c *ImplStd) handleErr(logger *zap.SugaredLogger, err error, key types.NamespacedName, startTime time.Time) {
+func (c *Impl) handleErr(logger *zap.SugaredLogger, err error, key types.NamespacedName, startTime time.Time) {
 	if IsSkipKey(err) {
 		c.workQueue.Forget(key)
 		return
@@ -596,14 +597,14 @@ func (c *ImplStd) handleErr(logger *zap.SugaredLogger, err error, key types.Name
 }
 
 // GlobalResync enqueues into the slow lane all objects from the passed SharedInformer
-func (c *ImplStd) GlobalResync(si cache.SharedInformer) {
+func (c *Impl) GlobalResync(si cache.SharedInformer) {
 	alwaysTrue := func(interface{}) bool { return true }
 	c.FilteredGlobalResync(alwaysTrue, si)
 }
 
 // FilteredGlobalResync enqueues all objects from the
 // SharedInformer that pass the filter function in to the slow queue.
-func (c *ImplStd) FilteredGlobalResync(f func(interface{}) bool, si cache.SharedInformer) {
+func (c *Impl) FilteredGlobalResync(f func(interface{}) bool, si cache.SharedInformer) {
 	if c.workQueue.ShuttingDown() {
 		return
 	}
@@ -795,7 +796,7 @@ func WaitForCacheSyncQuick(stopCh <-chan struct{}, cacheSyncs ...cache.InformerS
 }
 
 // StartAll kicks off all of the passed controllers with DefaultThreadsPerController.
-func StartAll(ctx context.Context, controllers ...Impl) error {
+func StartAll(ctx context.Context, controllers ...*Impl) error {
 	eg, egCtx := errgroup.WithContext(ctx)
 
 	// Start all of the controllers.

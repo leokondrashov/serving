@@ -33,7 +33,7 @@ func NewController(
 	ctx context.Context,
 	cmw configmap.Watcher,
 	collector metrics.Collector,
-) *controller.Impl {
+) *controller.ImplStd {
 	metricInformer := metricinformer.Get(ctx)
 
 	c := &reconciler{

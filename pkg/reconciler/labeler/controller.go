@@ -40,7 +40,7 @@ import (
 func NewController(
 	ctx context.Context,
 	cmw configmap.Watcher,
-) *controller.Impl {
+) controller.Impl {
 	logger := logging.FromContext(ctx)
 	routeInformer := routeinformer.Get(ctx)
 	configInformer := configurationinformer.Get(ctx)
@@ -50,7 +50,7 @@ func NewController(
 	configStore.WatchConfigs(cmw)
 
 	c := &Reconciler{}
-	impl := routereconciler.NewImpl(ctx, c, func(*controller.Impl) controller.Options {
+	impl := routereconciler.NewImpl(ctx, c, func(*controller.ImplStd) controller.Options {
 		return controller.Options{
 			ConfigStore: configStore,
 			// The labeler shouldn't mutate the route's status.

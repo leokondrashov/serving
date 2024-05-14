@@ -96,7 +96,7 @@ func testRevision() *v1.Revision {
 func newTestSetup(t *testing.T, opts ...reconcilerOption) (
 	ctx context.Context,
 	informers []controller.Informer,
-	ctrl *controller.Impl,
+	ctrl *controller.ImplStd,
 	configMapWatcher *configmap.ManualWatcher,
 	cf context.CancelFunc) {
 

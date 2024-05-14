@@ -44,7 +44,7 @@ func NewAdmissionControllerWithConfig(
 	wc func(context.Context) context.Context,
 	disallowUnknownFields bool,
 	callbacks map[schema.GroupVersionKind]Callback,
-) *controller.Impl {
+) *controller.ImplStd {
 
 	opts := []OptionFunc{
 		WithPath(path),
@@ -59,7 +59,7 @@ func NewAdmissionControllerWithConfig(
 	return newController(ctx, name, opts...)
 }
 
-func newController(ctx context.Context, name string, optsFunc ...OptionFunc) *controller.Impl {
+func newController(ctx context.Context, name string, optsFunc ...OptionFunc) *controller.ImplStd {
 	client := kubeclient.Get(ctx)
 	vwhInformer := vwhinformer.Get(ctx)
 	secretInformer := secretinformer.Get(ctx)
@@ -133,7 +133,7 @@ func NewAdmissionController(
 	wc func(context.Context) context.Context,
 	disallowUnknownFields bool,
 	callbacks ...map[schema.GroupVersionKind]Callback,
-) *controller.Impl {
+) *controller.ImplStd {
 	// This not ideal, we are using a variadic argument to effectively make callbacks optional
 	// This allows this addition to be non-breaking to consumers of /pkg
 	// TODO: once all sub-repos have adopted this, we might move this back to a traditional param.

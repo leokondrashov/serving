@@ -45,7 +45,7 @@ func NewControllerFactory(componentName string) injection.ControllerConstructor 
 	return func(
 		ctx context.Context,
 		cmw configmap.Watcher,
-	) *controller.Impl {
+	) controller.Impl {
 
 		caSecretName := componentName + caSecretNamePostfix
 		labelName := componentName + secretLabelNamePostfix

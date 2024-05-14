@@ -18,10 +18,7 @@ package kpa
 
 import (
 	"context"
-	"strconv"
-	"strings"
 
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 
 	networkingclient "knative.dev/networking/pkg/client/injection/client"
@@ -34,13 +31,13 @@ import (
 	pareconciler "knative.dev/serving/pkg/client/injection/reconciler/autoscaling/v1alpha1/podautoscaler"
 
 	"knative.dev/pkg/configmap"
-	"knative.dev/pkg/controller"
 	"knative.dev/pkg/logging"
 	pkgreconciler "knative.dev/pkg/reconciler"
 	"knative.dev/serving/pkg/apis/autoscaling"
 	autoscalingv1alpha1 "knative.dev/serving/pkg/apis/autoscaling/v1alpha1"
 	"knative.dev/serving/pkg/apis/serving"
 	"knative.dev/serving/pkg/autoscaler/config/autoscalerconfig"
+	controller "knative.dev/serving/pkg/autoscaler/throttled_controller"
 	"knative.dev/serving/pkg/deployment"
 	areconciler "knative.dev/serving/pkg/reconciler/autoscaling"
 	"knative.dev/serving/pkg/reconciler/autoscaling/config"
@@ -111,20 +108,7 @@ func NewController(
 	})
 
 	// Have the Deciders enqueue the PAs whose decisions have changed.
-	deciders.Watch(func(nn types.NamespacedName) {
-		if nn.Name != "" {
-			components := strings.Split(nn.Name, "-")
-			if len(components) >= 3 {
-				thirdComponent := components[2]
-				num, err := strconv.Atoi(thirdComponent)
-				if err == nil && num%2 == 0 {
-					impl.EnqueueKey(nn)
-				} else {
-					impl.EnqueueSlowKey(nn)
-				}
-			}
-		}
-	})
+	deciders.Watch(impl.EnqueueKey)
 
 	return impl
 }

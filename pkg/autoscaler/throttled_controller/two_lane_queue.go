@@ -14,9 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package controller
+package throttled_controller
 
 import (
+	"os"
+	"strconv"
+
+	"golang.org/x/time/rate"
 	"k8s.io/client-go/util/workqueue"
 )
 
@@ -24,21 +28,8 @@ import (
 // -- fast queue (anonymously aliased), whose contents are processed with priority.
 // -- slow queue (slowLane queue), whose contents are processed if fast queue has no items.
 // All the default methods operate on the fast queue, unless noted otherwise.
-type twoLaneQueue struct {
-	workqueue.RateLimitingInterface
-	slowLane workqueue.RateLimitingInterface
-	// consumerQueue is necessary to ensure that we're not reconciling
-	// the same object at the exact same time (e.g. if it had been enqueued
-	// in both fast and slow and is the only object there).
-	consumerQueue workqueue.Interface
 
-	name string
-
-	fastChan chan interface{}
-	slowChan chan interface{}
-}
-
-type ThrottledTwoLaneQueue struct {
+type throttledTwoLaneQueue struct {
 	workqueue.RateLimitingInterface
 	slowLane workqueue.RateLimitingInterface
 	// consumerQueue is necessary to ensure that we're not reconciling
@@ -53,8 +44,12 @@ type ThrottledTwoLaneQueue struct {
 }
 
 // Creates a new twoLaneQueue.
-func newTwoLaneWorkQueue(name string, rl workqueue.RateLimiter) *twoLaneQueue {
-	tlq := &twoLaneQueue{
+func newThrottledTwoLaneWorkQueue(name string, rl workqueue.RateLimiter) *throttledTwoLaneQueue {
+
+	queue_rps, _ := strconv.ParseFloat(os.Getenv("Queue_Throttle"), 64)
+	burst, _ := strconv.ParseInt(os.Getenv("Queue_Burst"), 10, 32)
+
+	tlq := &throttledTwoLaneQueue{
 		RateLimitingInterface: workqueue.NewNamedRateLimitingQueue(
 			rl,
 			name+"-fast",
@@ -63,10 +58,13 @@ func newTwoLaneWorkQueue(name string, rl workqueue.RateLimiter) *twoLaneQueue {
 			rl,
 			name+"-slow",
 		),
-		consumerQueue: workqueue.NewNamed(name + "-consumer"),
-		name:          name,
-		fastChan:      make(chan interface{}),
-		slowChan:      make(chan interface{}),
+		consumerQueue: workqueue.NewNamedRateLimitingQueue(
+			&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(queue_rps), int(burst))},
+			name+"-consumer",
+		),
+		name:     name,
+		fastChan: make(chan interface{}, 1),
+		slowChan: make(chan interface{}, 1),
 	}
 	// Run consumer thread.
 	go tlq.runConsumer()
@@ -90,55 +88,7 @@ func process(q workqueue.Interface, ch chan interface{}) {
 	}
 }
 
-func (tlq *twoLaneQueue) runConsumer() {
-	// Shutdown flags.
-	fast, slow := true, true
-	// When both producer queues are shutdown stop the consumerQueue.
-	defer tlq.consumerQueue.ShutDown()
-	// While any of the queues is still running, try to read off of them.
-	for fast || slow {
-		// By default drain the fast lane.
-		// Channels in select are picked random, so first
-		// we have a select that only looks at the fast lane queue.
-		if fast {
-			select {
-			case item, ok := <-tlq.fastChan:
-				if !ok {
-					// This queue is shutdown and drained. Stop looking at it.
-					fast = false
-					continue
-				}
-				tlq.consumerQueue.Add(item)
-				continue
-			default:
-				// This immediately exits the wait if the fast chan is empty.
-			}
-		}
-
-		// If the fast lane queue had no items, we can select from both.
-		// Obviously if suddenly both are populated at the same time there's a
-		// 50% chance that the slow would be picked first, but this should be
-		// a rare occasion not to really worry about it.
-		select {
-		case item, ok := <-tlq.fastChan:
-			if !ok {
-				// This queue is shutdown and drained. Stop looking at it.
-				fast = false
-				continue
-			}
-			tlq.consumerQueue.Add(item)
-		case item, ok := <-tlq.slowChan:
-			if !ok {
-				// This queue is shutdown and drained. Stop looking at it.
-				slow = false
-				continue
-			}
-			tlq.consumerQueue.Add(item)
-		}
-	}
-}
-
-func (tlq *ThrottledTwoLaneQueue) runConsumer() {
+func (tlq *throttledTwoLaneQueue) runConsumer() {
 	// Shutdown flags.
 	fast, slow := true, true
 	// When both producer queues are shutdown stop the consumerQueue.
@@ -188,7 +138,7 @@ func (tlq *ThrottledTwoLaneQueue) runConsumer() {
 
 // Shutdown implements workqueue.Interface.
 // Shutdown shuts down both queues.
-func (tlq *twoLaneQueue) ShutDown() {
+func (tlq *throttledTwoLaneQueue) ShutDown() {
 	tlq.RateLimitingInterface.ShutDown()
 	tlq.slowLane.ShutDown()
 }
@@ -197,57 +147,24 @@ func (tlq *twoLaneQueue) ShutDown() {
 // Done marks the item as completed in all the queues.
 // NB: this will just re-enqueue the object on the queue that
 // didn't originate the object.
-func (tlq *twoLaneQueue) Done(i interface{}) {
+func (tlq *throttledTwoLaneQueue) Done(i interface{}) {
 	tlq.consumerQueue.Done(i)
 }
 
 // Get implements workqueue.Interface.
 // It gets the item from fast lane if it has anything, alternatively
 // the slow lane.
-func (tlq *twoLaneQueue) Get() (interface{}, bool) {
+func (tlq *throttledTwoLaneQueue) Get() (interface{}, bool) {
 	return tlq.consumerQueue.Get()
 }
 
 // Len returns the sum of lengths.
 // NB: actual _number_ of unique object might be less than this sum.
-func (tlq *twoLaneQueue) Len() int {
+func (tlq *throttledTwoLaneQueue) Len() int {
 	return tlq.RateLimitingInterface.Len() + tlq.slowLane.Len() + tlq.consumerQueue.Len()
 }
 
 // SlowLane gives direct access to the slow queue.
-func (tlq *twoLaneQueue) SlowLane() workqueue.RateLimitingInterface {
-	return tlq.slowLane
-}
-
-// Shutdown implements workqueue.Interface.
-// Shutdown shuts down both queues.
-func (tlq *ThrottledTwoLaneQueue) ShutDown() {
-	tlq.RateLimitingInterface.ShutDown()
-	tlq.slowLane.ShutDown()
-}
-
-// Done implements workqueue.Interface.
-// Done marks the item as completed in all the queues.
-// NB: this will just re-enqueue the object on the queue that
-// didn't originate the object.
-func (tlq *ThrottledTwoLaneQueue) Done(i interface{}) {
-	tlq.consumerQueue.Done(i)
-}
-
-// Get implements workqueue.Interface.
-// It gets the item from fast lane if it has anything, alternatively
-// the slow lane.
-func (tlq *ThrottledTwoLaneQueue) Get() (interface{}, bool) {
-	return tlq.consumerQueue.Get()
-}
-
-// Len returns the sum of lengths.
-// NB: actual _number_ of unique object might be less than this sum.
-func (tlq *ThrottledTwoLaneQueue) Len() int {
-	return tlq.RateLimitingInterface.Len() + tlq.slowLane.Len() + tlq.consumerQueue.Len()
-}
-
-// SlowLane gives direct access to the slow queue.
-func (tlq *ThrottledTwoLaneQueue) SlowLane() workqueue.RateLimitingInterface {
+func (tlq *throttledTwoLaneQueue) SlowLane() workqueue.RateLimitingInterface {
 	return tlq.slowLane
 }

@@ -44,15 +44,15 @@ func (l *leaderAware) Reconcile(ctx context.Context, key string) error {
 	return l.reconciler.Reconcile(ctx, key)
 }
 
-func setupSharedElector(ctx context.Context, controllers []*controller.Impl) (leaderelection.Elector, error) {
+func setupSharedElector(ctx context.Context, controllers []controller.Impl) (leaderelection.Elector, error) {
 	reconcilers := make([]*leaderAware, 0, len(controllers))
 
 	for _, c := range controllers {
-		if r, ok := c.Reconciler.(leaderAwareReconciler); ok {
+		if r, ok := c.GetReconciler().(leaderAwareReconciler); ok {
 			la := &leaderAware{reconciler: r, enqueue: c.MaybeEnqueueBucketKey}
 			// rewire the controller's reconciler so it isn't leader aware
 			// this prevents the universal bucket from being promoted
-			c.Reconciler = la
+			c.SetReconciler(la)
 			reconcilers = append(reconcilers, la)
 		}
 	}

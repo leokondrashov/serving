@@ -37,6 +37,7 @@ import (
 	"knative.dev/serving/pkg/apis/autoscaling"
 	autoscalingv1alpha1 "knative.dev/serving/pkg/apis/autoscaling/v1alpha1"
 	"knative.dev/serving/pkg/autoscaler/config/autoscalerconfig"
+	"knative.dev/serving/pkg/autoscaler/throttled_controller"
 	areconciler "knative.dev/serving/pkg/reconciler/autoscaling"
 	"knative.dev/serving/pkg/reconciler/autoscaling/config"
 )
@@ -45,7 +46,7 @@ import (
 func NewController(
 	ctx context.Context,
 	cmw configmap.Watcher,
-) *controller.Impl {
+) controller.Impl {
 	logger := logging.FromContext(ctx)
 	paInformer := painformer.Get(ctx)
 	sksInformer := sksinformer.Get(ctx)
@@ -65,7 +66,7 @@ func NewController(
 		kubeClient: kubeclient.Get(ctx),
 		hpaLister:  hpaInformer.Lister(),
 	}
-	impl := pareconciler.NewImpl(ctx, c, autoscaling.HPA, func(impl *controller.Impl) controller.Options {
+	impl := pareconciler.NewImpl(ctx, c, autoscaling.HPA, func(impl *throttled_controller.Impl) throttled_controller.Options {
 		logger.Info("Setting up ConfigMap receivers")
 		configsToResync := []interface{}{
 			&autoscalerconfig.Config{},
@@ -76,20 +77,20 @@ func NewController(
 		})
 		configStore := config.NewStore(logger.Named("config-store"), resync)
 		configStore.WatchConfigs(cmw)
-		return controller.Options{ConfigStore: configStore}
+		return throttled_controller.Options{ConfigStore: configStore}
 	})
 
 	logger.Info("Setting up hpa-class event handlers")
 
 	paInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
 		FilterFunc: onlyHPAClass,
-		Handler:    controller.HandleAll(impl.Enqueue),
+		Handler:    throttled_controller.HandleAll(impl.Enqueue),
 	})
 
-	onlyPAControlled := controller.FilterController(&autoscalingv1alpha1.PodAutoscaler{})
+	onlyPAControlled := throttled_controller.FilterController(&autoscalingv1alpha1.PodAutoscaler{})
 	handleMatchingControllers := cache.FilteringResourceEventHandler{
 		FilterFunc: pkgreconciler.ChainFilterFuncs(onlyHPAClass, onlyPAControlled),
-		Handler:    controller.HandleAll(impl.EnqueueControllerOf),
+		Handler:    throttled_controller.HandleAll(impl.EnqueueControllerOf),
 	}
 	hpaInformer.Informer().AddEventHandler(handleMatchingControllers)
 	sksInformer.Informer().AddEventHandler(handleMatchingControllers)

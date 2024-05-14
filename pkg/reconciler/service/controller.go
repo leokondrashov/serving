@@ -39,7 +39,7 @@ import (
 func NewController(
 	ctx context.Context,
 	cmw configmap.Watcher,
-) *controller.Impl {
+) controller.Impl {
 	logger := logging.FromContext(ctx)
 	serviceInformer := kserviceinformer.Get(ctx)
 	routeInformer := routeinformer.Get(ctx)
@@ -55,7 +55,7 @@ func NewController(
 		revisionInformer.Lister(),
 		routeInformer.Lister(),
 	)
-	opts := func(*controller.Impl) controller.Options {
+	opts := func(*controller.ImplStd) controller.Options {
 		return controller.Options{ConfigStore: configStore}
 	}
 	impl := ksvcreconciler.NewImpl(ctx, c, opts)

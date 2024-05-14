@@ -81,7 +81,7 @@ func newTestController(t *testing.T, configs []*corev1.ConfigMap, opts ...reconc
 	context.Context,
 	context.CancelFunc,
 	[]controller.Informer,
-	*controller.Impl,
+	*controller.ImplStd,
 	*configmap.ManualWatcher) {
 
 	ctx, cancel, informers := SetupFakeContextWithCancel(t)
@@ -161,7 +161,7 @@ func newTestController(t *testing.T, configs []*corev1.ConfigMap, opts ...reconc
 func createRevision(
 	t *testing.T,
 	ctx context.Context,
-	controller *controller.Impl,
+	controller *controller.ImplStd,
 	rev *v1.Revision,
 ) *v1.Revision {
 	t.Helper()
@@ -178,7 +178,7 @@ func createRevision(
 func updateRevision(
 	t *testing.T,
 	ctx context.Context,
-	controller *controller.Impl,
+	controller *controller.ImplStd,
 	rev *v1.Revision,
 ) {
 	t.Helper()

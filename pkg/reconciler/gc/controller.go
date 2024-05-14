@@ -38,7 +38,7 @@ const controllerAgentName = "revision-gc-controller"
 func NewController(
 	ctx context.Context,
 	cmw configmap.Watcher,
-) *controller.Impl {
+) controller.Impl {
 	logger := logging.FromContext(ctx)
 	configurationInformer := configurationinformer.Get(ctx)
 	revisionInformer := revisioninformer.Get(ctx)
@@ -47,7 +47,7 @@ func NewController(
 		client:         servingclient.Get(ctx),
 		revisionLister: revisionInformer.Lister(),
 	}
-	return configreconciler.NewImpl(ctx, c, func(impl *controller.Impl) controller.Options {
+	return configreconciler.NewImpl(ctx, c, func(impl *controller.ImplStd) controller.Options {
 		// Since the gc controller came from the configuration controller, having event handlers
 		// on both configuration and revision matches the existing behaviors of the configuration
 		// controller. This is to minimize risk heading into v1.

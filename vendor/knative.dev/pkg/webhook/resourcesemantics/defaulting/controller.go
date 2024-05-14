@@ -44,7 +44,7 @@ func NewAdmissionController(
 	wc func(context.Context) context.Context,
 	disallowUnknownFields bool,
 	callbacks ...map[schema.GroupVersionKind]Callback,
-) *controller.Impl {
+) *controller.ImplStd {
 
 	// This not ideal, we are using a variadic argument to effectively make callbacks optional
 	// This allows this addition to be non-breaking to consumers of /pkg
@@ -73,7 +73,7 @@ func NewAdmissionController(
 	return newController(ctx, name, opts...)
 }
 
-func newController(ctx context.Context, name string, optsFunc ...OptionFunc) *controller.Impl {
+func newController(ctx context.Context, name string, optsFunc ...OptionFunc) *controller.ImplStd {
 	client := kubeclient.Get(ctx)
 	mwhInformer := mwhinformer.Get(ctx)
 	secretInformer := secretinformer.Get(ctx)
