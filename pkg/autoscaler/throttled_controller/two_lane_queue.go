@@ -17,11 +17,16 @@ limitations under the License.
 package throttled_controller
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"golang.org/x/time/rate"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
+	"knative.dev/pkg/logging/logkey"
 )
 
 // twoLaneQueue is a rate limited queue that wraps around two queues
@@ -41,10 +46,12 @@ type throttledTwoLaneQueue struct {
 
 	fastChan chan interface{}
 	slowChan chan interface{}
+
+	logger *zap.SugaredLogger
 }
 
 // Creates a new twoLaneQueue.
-func newThrottledTwoLaneWorkQueue(name string, rl workqueue.RateLimiter) *throttledTwoLaneQueue {
+func newThrottledTwoLaneWorkQueue(name string, rl workqueue.RateLimiter, logger *zap.SugaredLogger) *throttledTwoLaneQueue {
 
 	queue_rps, _ := strconv.ParseFloat(os.Getenv("Queue_Throttle"), 64)
 	burst, _ := strconv.ParseInt(os.Getenv("Queue_Burst"), 10, 32)
@@ -65,6 +72,7 @@ func newThrottledTwoLaneWorkQueue(name string, rl workqueue.RateLimiter) *thrott
 		name:     name,
 		fastChan: make(chan interface{}, 1),
 		slowChan: make(chan interface{}, 1),
+		logger:   logger,
 	}
 	// Run consumer thread.
 	go tlq.runConsumer()
@@ -106,6 +114,11 @@ func (tlq *throttledTwoLaneQueue) runConsumer() {
 					fast = false
 					continue
 				}
+				if logger := tlq.logger.Desugar(); logger.Core().Enabled(zapcore.DebugLevel) {
+					logger.Debug(fmt.Sprintf("Popping from the fast lane %s",
+						safeKey(item.(types.NamespacedName))),
+						zap.String(logkey.Key, item.(types.NamespacedName).String()))
+				}
 				tlq.consumerQueue.AddRateLimited(item)
 				continue
 			default:
@@ -124,12 +137,22 @@ func (tlq *throttledTwoLaneQueue) runConsumer() {
 				fast = false
 				continue
 			}
+			if logger := tlq.logger.Desugar(); logger.Core().Enabled(zapcore.DebugLevel) {
+				logger.Debug(fmt.Sprintf("Popping from the fast lane %s",
+					safeKey(item.(types.NamespacedName))),
+					zap.String(logkey.Key, item.(types.NamespacedName).String()))
+			}
 			tlq.consumerQueue.AddRateLimited(item)
 		case item, ok := <-tlq.slowChan:
 			if !ok {
 				// This queue is shutdown and drained. Stop looking at it.
 				slow = false
 				continue
+			}
+			if logger := tlq.logger.Desugar(); logger.Core().Enabled(zapcore.DebugLevel) {
+				logger.Debug(fmt.Sprintf("Popping from the slow lane %s",
+					safeKey(item.(types.NamespacedName))),
+					zap.String(logkey.Key, item.(types.NamespacedName).String()))
 			}
 			tlq.consumerQueue.AddRateLimited(item)
 		}

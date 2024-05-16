@@ -247,7 +247,7 @@ func NewContext(ctx context.Context, r controller.Reconciler, options Controller
 	i := &Impl{
 		Name:          options.WorkQueueName,
 		Reconciler:    r,
-		workQueue:     newThrottledTwoLaneWorkQueue(options.WorkQueueName, options.RateLimiter),
+		workQueue:     newThrottledTwoLaneWorkQueue(options.WorkQueueName, options.RateLimiter, options.Logger),
 		logger:        options.Logger,
 		statsReporter: options.Reporter,
 		Concurrency:   options.Concurrency,
