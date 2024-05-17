@@ -39,6 +39,7 @@ import (
 	"knative.dev/pkg/logging"
 	"knative.dev/pkg/logging/logkey"
 	"knative.dev/pkg/reconciler"
+	"knative.dev/serving/pkg/activator/handler"
 	"knative.dev/serving/pkg/apis/serving"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	revisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/revision"
@@ -157,6 +158,9 @@ type revisionThrottler struct {
 	// This is a subset of podTrackers.
 	assignedTrackers []*podTracker
 
+	// newly created instances first handle the held requests before being included into the pool.
+	newTrackers chan *podTracker
+
 	// If we don't have a healthy clusterIPTracker this is set to nil, otherwise
 	// it is the l4dest for this revision's private clusterIP.
 	clusterIPTracker *podTracker
@@ -165,13 +169,19 @@ type revisionThrottler struct {
 	// request path. This is: trackers, clusterIPDest.
 	mux sync.RWMutex
 
+	// queue of notification channels for requests waiting for capacity.
+	queue chan chan struct{}
+
+	cr *handler.ConcurrencyReporter
+
 	logger *zap.SugaredLogger
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
 	containerConcurrency int, proto string,
 	breakerParams queue.BreakerParams,
-	logger *zap.SugaredLogger) *revisionThrottler {
+	logger *zap.SugaredLogger,
+	cr *handler.ConcurrencyReporter) *revisionThrottler {
 	logger = logger.With(zap.String(logkey.Key, revID.String()))
 	var (
 		revBreaker breaker
@@ -198,6 +208,9 @@ func newRevisionThrottler(revID types.NamespacedName,
 		protocol:             proto,
 		activatorIndex:       *atomic.NewInt32(-1), // Start with unknown.
 		lbPolicy:             lbp,
+		queue:                make(chan chan struct{}, breakerQueueDepth),
+		newTrackers:          make(chan *podTracker, breakerQueueDepth),
+		cr:                   cr,
 	}
 }
 
@@ -216,30 +229,58 @@ func (rt *revisionThrottler) acquireDest(ctx context.Context) (func(), *podTrack
 }
 
 func (rt *revisionThrottler) try(ctx context.Context, function func(string) error) error {
-	var ret error
-
 	// Retrying infinitely as long as we receive no dest. Outer semaphore and inner
 	// pod capacity are not changed atomically, hence they can race each other. We
 	// "reenqueue" requests should that happen.
-	reenqueue := true
-	for reenqueue {
-		reenqueue = false
-		if err := rt.breaker.Maybe(ctx, func() {
-			cb, tracker := rt.acquireDest(ctx)
-			if tracker == nil {
-				// This can happen if individual requests raced each other or if pod
-				// capacity was decreased after passing the outer semaphore.
-				reenqueue = true
-				return
-			}
-			defer cb()
-			// We already reserved a guaranteed spot. So just execute the passed functor.
-			ret = function(tracker.dest)
-		}); err != nil {
-			return err
+
+	if release, err := rt.breaker.Reserve(ctx); err {
+		defer release()
+		cb, tracker := rt.acquireDest(ctx)
+		if tracker == nil {
+			// This can happen if individual requests raced each other or if pod
+			// capacity was decreased after passing the outer semaphore.
+			rt.logger.Fatalf("No tracker available for revision %s", rt.revID)
+			return nil
 		}
+		defer cb()
+		// We already reserved a guaranteed spot. So just execute the passed functor.
+		return function(tracker.dest)
 	}
-	return ret
+
+	rt.logger.Debugf("Triggering creation of new instance for %s", rt.revID)
+	// We didn't manage to reserve a spot. We need to create a new instance and wait for its creation
+	rt.cr.Poke()
+	wakeupSignal := make(chan struct{}, 1)
+	rt.queue <- wakeupSignal
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-wakeupSignal:
+		rt.logger.Debugf("Request is woken up", rt.revID)
+	}
+
+	tracker := <-rt.newTrackers
+	defer func() {
+		rt.insertTracker(tracker)
+	}()
+	rt.logger.Debugf("Forwarding to the new instance %s", tracker.dest)
+	return function(tracker.dest)
+
+	// if release, err := rt.breaker.Reserve(ctx); err {
+	// 	defer release()
+	// 	cb, tracker := rt.acquireDest(ctx)
+	// 	if tracker == nil {
+	// 		// This can happen if individual requests raced each other or if pod
+	// 		// capacity was decreased after passing the outer semaphore.
+	// 		rt.logger.Fatalf("No tracker available for revision %s", rt.revID)
+	// 		return nil
+	// 	}
+	// 	defer cb()
+	// 	// We already reserved a guaranteed spot. So just execute the passed functor.
+	// 	return function(tracker.dest)
+	// } else {
+	// 	rt.logger.Fatalf("Not able to get instance for %s", rt.revID)
+	// }
 }
 
 func (rt *revisionThrottler) calculateCapacity(backendCount, numTrackers, activatorCount int) int {
@@ -291,6 +332,9 @@ func (rt *revisionThrottler) updateCapacity(backendCount int) {
 	// We have to make assignments on each updateCapacity, since if number
 	// of activators changes, then we need to rebalance the assignedTrackers.
 	ac, ai := int(rt.numActivators.Load()), int(rt.activatorIndex.Load())
+	if ac > 1 {
+		rt.logger.Fatalf("Several Activators in the cluster %s", ac)
+	}
 	numTrackers := func() int {
 		// We do not have to process the `podTrackers` under lock, since
 		// updateCapacity is guaranteed to be executed by a single goroutine.
@@ -307,16 +351,43 @@ func (rt *revisionThrottler) updateCapacity(backendCount int) {
 			return rt.podTrackers[i].dest < rt.podTrackers[j].dest
 		})
 		assigned := rt.podTrackers
-		if rt.containerConcurrency > 0 {
-			rt.resetTrackers()
-			assigned = assignSlice(rt.podTrackers, ai, ac, rt.containerConcurrency)
-		}
+		// if rt.containerConcurrency > 0 {
+		// 	rt.resetTrackers()
+		// 	assigned = assignSlice(rt.podTrackers, ai, ac, rt.containerConcurrency)
+		// }
 		rt.logger.Debugf("Trackers %d/%d: assignment: %v", ai, ac, assigned)
 		// The actual write out of the assigned trackers has to be under lock.
 		rt.mux.Lock()
 		defer rt.mux.Unlock()
-		rt.assignedTrackers = assigned
-		return len(assigned)
+		i_old, i_new := 0, 0
+		for (i_new < len(assigned)) && (i_old < len(rt.assignedTrackers)) {
+			if assigned[i_new] == rt.assignedTrackers[i_old] {
+				i_new++
+				i_old++
+				continue
+			}
+
+			if assigned[i_new].dest < rt.assignedTrackers[i_old].dest {
+				rt.logger.Debugf("Pushing new tracker %s", assigned[i_new].dest)
+				rt.newTrackers <- assigned[i_new]
+				rt.logger.Debugf("Waking up the held request")
+				(<-rt.queue) <- struct{}{}
+				copy(assigned[i_new:], assigned[i_new+1:]) // remove inserted from the list
+				assigned = assigned[:len(assigned)-1]
+			} else {
+				i_old++ // skip deleted tracker
+			}
+		}
+
+		for _, pd := range assigned[i_new:] {
+			rt.logger.Debugf("Pushing new tracker %s", pd.dest)
+			rt.newTrackers <- pd
+			rt.logger.Debugf("Waking up the held request")
+			(<-rt.queue) <- struct{}{} // wake up a waiting request
+		}
+		rt.assignedTrackers = assigned[:i_new]
+		rt.logger.Debugf("Finish updating trackers. Available trackers %v", rt.assignedTrackers)
+		return len(rt.assignedTrackers)
 	}()
 
 	capacity := rt.calculateCapacity(backendCount, numTrackers, ac)
@@ -324,6 +395,26 @@ func (rt *revisionThrottler) updateCapacity(backendCount int) {
 		capacity, backendCount, ai, ac)
 
 	rt.backendCount = backendCount
+	rt.breaker.UpdateConcurrency(capacity)
+}
+
+func (rt *revisionThrottler) insertTracker(tracker *podTracker) {
+	rt.logger.Debugf("Adding tracker %s into general pool", tracker.dest)
+	numTrackers := func() int {
+		rt.mux.Lock()
+		defer rt.mux.Unlock()
+		assigned := append(rt.assignedTrackers, tracker)
+		sort.Slice(assigned, func(i, j int) bool {
+			return assigned[i].dest < assigned[j].dest
+		})
+		rt.assignedTrackers = assigned
+		return len(assigned)
+	}()
+
+	capacity := rt.calculateCapacity(rt.backendCount, numTrackers, int(rt.numActivators.Load()))
+	rt.logger.Infof("Set capacity to %d (backends: %d)",
+		capacity, rt.backendCount)
+
 	rt.breaker.UpdateConcurrency(capacity)
 }
 
@@ -455,10 +546,11 @@ type Throttler struct {
 	ipAddress               string // The IP address of this activator.
 	logger                  *zap.SugaredLogger
 	epsUpdateCh             chan *corev1.Endpoints
+	cr                      *handler.ConcurrencyReporter
 }
 
 // NewThrottler creates a new Throttler
-func NewThrottler(ctx context.Context, ipAddr string) *Throttler {
+func NewThrottler(ctx context.Context, ipAddr string, cr *handler.ConcurrencyReporter) *Throttler {
 	revisionInformer := revisioninformer.Get(ctx)
 	t := &Throttler{
 		revisionThrottlers: make(map[types.NamespacedName]*revisionThrottler),
@@ -466,6 +558,7 @@ func NewThrottler(ctx context.Context, ipAddr string) *Throttler {
 		ipAddress:          ipAddr,
 		logger:             logging.FromContext(ctx),
 		epsUpdateCh:        make(chan *corev1.Endpoints),
+		cr:                 cr,
 	}
 
 	// Watch revisions to create throttler with backlog immediately and delete
@@ -547,6 +640,7 @@ func (t *Throttler) getOrCreateRevisionThrottler(revID types.NamespacedName) (*r
 			pkgnet.ServicePortName(rev.GetProtocol()),
 			queue.BreakerParams{QueueDepth: breakerQueueDepth, MaxConcurrency: revisionMaxConcurrency},
 			t.logger,
+			t.cr,
 		)
 		t.revisionThrottlers[revID] = revThrottler
 	}
@@ -632,6 +726,10 @@ func (rt *revisionThrottler) handlePubEpsUpdate(eps *corev1.Endpoints, selfIP st
 	if newAI == -1 {
 		// No need to do anything, this activator is not in path.
 		return
+	}
+
+	if newNA > 1 {
+		rt.logger.Fatalf("Several Activators in the cluster %d", newNA)
 	}
 
 	na, ai := rt.numActivators.Load(), rt.activatorIndex.Load()

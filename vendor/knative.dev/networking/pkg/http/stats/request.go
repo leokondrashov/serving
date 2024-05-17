@@ -17,6 +17,7 @@ limitations under the License.
 package stats
 
 import (
+	"math"
 	"sync"
 	"time"
 
@@ -59,6 +60,7 @@ type RequestStats struct {
 
 	// State variables that track the current state. Not reset after reporting.
 	concurrency, proxiedConcurrency float64
+	maxConcurrency                  float64
 	lastChange                      time.Time
 
 	// Reporting variables that track state over the current window. Reset after
@@ -77,6 +79,7 @@ type RequestStatsReport struct {
 	// concurrency of 1.
 	AverageConcurrency float64
 	Concurrency        int32
+	MaxConcurrency     int32
 	// AverageProxiedConcurrency is the average concurrency of all proxied requests.
 	// The same calculation as above applies.
 	AverageProxiedConcurrency float64
@@ -120,6 +123,7 @@ func (s *RequestStats) HandleEvent(event ReqEvent) {
 	case ReqIn:
 		s.requestCount++
 		s.concurrency++
+		s.maxConcurrency = math.Max(s.maxConcurrency, s.concurrency)
 	case ProxiedOut:
 		s.proxiedConcurrency--
 		fallthrough
@@ -145,6 +149,7 @@ func (s *RequestStats) Report(now time.Time) RequestStatsReport {
 	if s.secondsInUse > 0 {
 		report.AverageConcurrency = s.computedConcurrency / s.secondsInUse
 		report.Concurrency = int32(s.concurrency)
+		report.MaxConcurrency = int32(s.maxConcurrency)
 		report.AverageProxiedConcurrency = s.computedProxiedConcurrency / s.secondsInUse
 	}
 
@@ -156,4 +161,5 @@ func (s *RequestStats) reset() {
 	s.computedConcurrency, s.computedProxiedConcurrency = 0, 0
 	s.requestCount, s.proxiedCount = 0, 0
 	s.secondsInUse = 0
+	s.maxConcurrency = s.concurrency
 }

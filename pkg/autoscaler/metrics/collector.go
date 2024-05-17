@@ -381,8 +381,8 @@ func (c *collection) lastError() error {
 func (c *collection) record(now time.Time, stat Stat) {
 	// Proxied requests have been counted at the activator. Subtract
 	// them to avoid double counting.
-	c.concurrencyBuckets.Record(now, float64(stat.ConcurrentRequests))
-	c.concurrencyPanicBuckets.Record(now, float64(stat.ConcurrentRequests))
+	c.concurrencyBuckets.Record(now, float64(stat.MaxConcurrentRequests))
+	c.concurrencyPanicBuckets.Record(now, float64(stat.MaxConcurrentRequests))
 	rps := stat.RequestCount - stat.ProxiedRequestCount
 	c.rpsBuckets.Record(now, rps)
 	c.rpsPanicBuckets.Record(now, rps)
@@ -392,6 +392,7 @@ func (c *collection) record(now time.Time, stat Stat) {
 func (dst *Stat) add(src Stat) {
 	dst.AverageConcurrentRequests += src.AverageConcurrentRequests
 	dst.ConcurrentRequests += src.ConcurrentRequests
+	dst.MaxConcurrentRequests += src.MaxConcurrentRequests
 	dst.AverageProxiedConcurrentRequests += src.AverageProxiedConcurrentRequests
 	dst.RequestCount += src.RequestCount
 	dst.ProxiedRequestCount += src.ProxiedRequestCount
@@ -411,6 +412,7 @@ func (dst *Stat) add(src Stat) {
 func (dst *Stat) average(sample, total float64) {
 	dst.AverageConcurrentRequests = dst.AverageConcurrentRequests / sample * total
 	dst.ConcurrentRequests = int32(float64(dst.ConcurrentRequests) / sample * total)
+	dst.MaxConcurrentRequests = int32(float64(dst.MaxConcurrentRequests) / sample * total)
 	dst.AverageProxiedConcurrentRequests = dst.AverageProxiedConcurrentRequests / sample * total
 	dst.RequestCount = dst.RequestCount / sample * total
 	dst.ProxiedRequestCount = dst.ProxiedRequestCount / sample * total
