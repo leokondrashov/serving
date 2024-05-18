@@ -285,7 +285,7 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 
 func (rt *revisionThrottler) calculateCapacity(backendCount, numTrackers, activatorCount int) int {
 	targetCapacity := 0
-	if numTrackers > 0 {
+	if rt.clusterIPTracker == nil {
 		// Capacity is computed based off of number of trackers,
 		// when using pod direct routing.
 		// We use number of assignedTrackers (numTrackers) for calculation
@@ -328,7 +328,7 @@ func (rt *revisionThrottler) resetTrackers() {
 // the assigned trackers to the Activator instance.
 // Currently updateCapacity is ensured to be invoked from a single go routine
 // and this does not synchronize
-func (rt *revisionThrottler) updateCapacity(backendCount int) {
+func (rt *revisionThrottler) updateCapacity(backendCount int, deleted, added []*podTracker) {
 	// We have to make assignments on each updateCapacity, since if number
 	// of activators changes, then we need to rebalance the assignedTrackers.
 	ac, ai := int(rt.numActivators.Load()), int(rt.activatorIndex.Load())
@@ -350,42 +350,35 @@ func (rt *revisionThrottler) updateCapacity(backendCount int) {
 		sort.Slice(rt.podTrackers, func(i, j int) bool {
 			return rt.podTrackers[i].dest < rt.podTrackers[j].dest
 		})
-		assigned := rt.podTrackers
+
 		// if rt.containerConcurrency > 0 {
 		// 	rt.resetTrackers()
 		// 	assigned = assignSlice(rt.podTrackers, ai, ac, rt.containerConcurrency)
 		// }
-		rt.logger.Debugf("Trackers %d/%d: assignment: %v", ai, ac, assigned)
+		rt.logger.Debugf("Trackers %d/%d: diff: +%v, -%v", ai, ac, added, deleted)
 		// The actual write out of the assigned trackers has to be under lock.
 		rt.mux.Lock()
 		defer rt.mux.Unlock()
-		i_old, i_new := 0, 0
-		for (i_new < len(assigned)) && (i_old < len(rt.assignedTrackers)) {
-			if assigned[i_new] == rt.assignedTrackers[i_old] {
-				i_new++
-				i_old++
-				continue
-			}
 
-			if assigned[i_new].dest < rt.assignedTrackers[i_old].dest {
-				rt.logger.Debugf("Pushing new tracker %s", assigned[i_new].dest)
-				rt.newTrackers <- assigned[i_new]
-				rt.logger.Debugf("Waking up the held request")
+		i_del := 0
+		for i := 0; (i < len(rt.assignedTrackers)) && (i_del < len(deleted)); {
+			if rt.assignedTrackers[i] == deleted[i_del] {
+				rt.assignedTrackers = append(rt.assignedTrackers[:i], rt.assignedTrackers[i+1:]...)
+				i_del++
+			}
+			i++
+		}
+
+		for _, t := range added {
+			rt.logger.Debugf("Pushing tracker %s as a new instance", t.dest)
+			if len(rt.queue) > 0 {
+				// We have requests waiting for capacity, so we can signal them.
+				rt.newTrackers <- t
 				(<-rt.queue) <- struct{}{}
-				copy(assigned[i_new:], assigned[i_new+1:]) // remove inserted from the list
-				assigned = assigned[:len(assigned)-1]
 			} else {
-				i_old++ // skip deleted tracker
+				rt.insertTracker(t)
 			}
 		}
-
-		for _, pd := range assigned[i_new:] {
-			rt.logger.Debugf("Pushing new tracker %s", pd.dest)
-			rt.newTrackers <- pd
-			rt.logger.Debugf("Waking up the held request")
-			(<-rt.queue) <- struct{}{} // wake up a waiting request
-		}
-		rt.assignedTrackers = assigned[:i_new]
 		rt.logger.Debugf("Finish updating trackers. Available trackers %v", rt.assignedTrackers)
 		return len(rt.assignedTrackers)
 	}()
@@ -425,6 +418,7 @@ func (rt *revisionThrottler) updateThrottlerState(backendCount int, trackers []*
 	// Update trackers / clusterIP before capacity. Otherwise we can race updating our breaker when
 	// we increase capacity, causing a request to fall through before a tracker is added, causing an
 	// incorrect LB decision.
+	deleted, added := diff(rt.podTrackers, trackers)
 	if func() bool {
 		rt.mux.Lock()
 		defer rt.mux.Unlock()
@@ -434,12 +428,43 @@ func (rt *revisionThrottler) updateThrottlerState(backendCount int, trackers []*
 	}() {
 		// If we have an address to target, then pass through an accurate
 		// accounting of the number of backends.
-		rt.updateCapacity(backendCount)
+		rt.updateCapacity(backendCount, deleted, added)
 	} else {
 		// If we do not have an address to target, then we should treat it
 		// as though we have zero backends.
-		rt.updateCapacity(0)
+		rt.updateCapacity(0, nil, nil)
 	}
+}
+
+func diff(old, new []*podTracker) (deleted, added []*podTracker) {
+	sort.Slice(old, func(i, j int) bool {
+		return old[i].dest < old[j].dest
+	})
+	sort.Slice(new, func(i, j int) bool {
+		return new[i].dest < new[j].dest
+	})
+	diff := make([]*podTracker, 0, len(new))
+	del := make([]*podTracker, 0, len(old))
+	i_old, i_new := 0, 0
+	for (i_new < len(new)) && (i_old < len(old)) {
+		if new[i_new] == old[i_old] {
+			i_new++
+			i_old++
+			continue
+		}
+
+		if new[i_new].dest < old[i_old].dest {
+			diff = append(diff, new[i_new])
+			i_new++
+		} else {
+			del = append(del, old[i_old])
+			i_old++ // skip deleted tracker
+		}
+	}
+
+	diff = append(diff, new[i_new:]...)
+
+	return del, diff
 }
 
 // pickIndices picks the indices for the slicing.
@@ -742,7 +767,7 @@ func (rt *revisionThrottler) handlePubEpsUpdate(eps *corev1.Endpoints, selfIP st
 	rt.activatorIndex.Store(newAI)
 	rt.logger.Infof("This activator index is %d/%d was %d/%d",
 		newAI, newNA, ai, na)
-	rt.updateCapacity(rt.backendCount)
+	rt.updateCapacity(rt.backendCount, rt.assignedTrackers, []*podTracker{})
 }
 
 // inferIndex returns the index of this activator slice.
