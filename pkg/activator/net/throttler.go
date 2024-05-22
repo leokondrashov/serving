@@ -251,6 +251,7 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 	// We didn't manage to reserve a spot. We need to create a new instance and wait for its creation
 	rt.cr.Poke()
 	wakeupSignal := make(chan struct{}, 1)
+	defer close(wakeupSignal)
 	rt.queue <- wakeupSignal
 	select {
 	case <-ctx.Done():
@@ -365,18 +366,36 @@ func (rt *revisionThrottler) updateCapacity(backendCount int, deleted, added []*
 			if rt.assignedTrackers[i] == deleted[i_del] {
 				rt.assignedTrackers = append(rt.assignedTrackers[:i], rt.assignedTrackers[i+1:]...)
 				i_del++
+			} else if rt.assignedTrackers[i].dest < deleted[i_del].dest {
+				i++
+			} else {
+				rt.logger.Errorf("Deleting non-existing tracker %s", deleted[i_del].dest)
+				i_del++
 			}
-			i++
 		}
 
 		for _, t := range added {
 			rt.logger.Debugf("Pushing tracker %s as a new instance", t.dest)
 			if len(rt.queue) > 0 {
-				// We have requests waiting for capacity, so we can signal them.
-				rt.newTrackers <- t
-				(<-rt.queue) <- struct{}{}
+				select {
+				case (<-rt.queue) <- struct{}{}:
+					// We have requests waiting for capacity, so we can signal them.
+					rt.newTrackers <- t
+				default: // executed if we have a dead request in the queue
+					rt.logger.Debugf("Request is not listening on its channel, dropping the request")
+					assigned := append(rt.assignedTrackers, t)
+					sort.Slice(assigned, func(i, j int) bool {
+						return assigned[i].dest < assigned[j].dest
+					})
+					rt.assignedTrackers = assigned
+				}
 			} else {
-				rt.insertTracker(t)
+				rt.logger.Debug("No requests waiting for capacity, adding tracker directly")
+				assigned := append(rt.assignedTrackers, t)
+				sort.Slice(assigned, func(i, j int) bool {
+					return assigned[i].dest < assigned[j].dest
+				})
+				rt.assignedTrackers = assigned
 			}
 		}
 		rt.logger.Debugf("Finish updating trackers. Available trackers %v", rt.assignedTrackers)
@@ -424,7 +443,7 @@ func (rt *revisionThrottler) updateThrottlerState(backendCount int, trackers []*
 		defer rt.mux.Unlock()
 		rt.podTrackers = trackers
 		rt.clusterIPTracker = clusterIPDest
-		return clusterIPDest != nil || len(trackers) > 0
+		return true
 	}() {
 		// If we have an address to target, then pass through an accurate
 		// accounting of the number of backends.
@@ -458,11 +477,12 @@ func diff(old, new []*podTracker) (deleted, added []*podTracker) {
 			i_new++
 		} else {
 			del = append(del, old[i_old])
-			i_old++ // skip deleted tracker
+			i_old++
 		}
 	}
 
 	diff = append(diff, new[i_new:]...)
+	del = append(del, old[i_old:]...)
 
 	return del, diff
 }
@@ -767,7 +787,7 @@ func (rt *revisionThrottler) handlePubEpsUpdate(eps *corev1.Endpoints, selfIP st
 	rt.activatorIndex.Store(newAI)
 	rt.logger.Infof("This activator index is %d/%d was %d/%d",
 		newAI, newNA, ai, na)
-	rt.updateCapacity(rt.backendCount, rt.assignedTrackers, []*podTracker{})
+	rt.updateCapacity(rt.backendCount, []*podTracker{}, []*podTracker{})
 }
 
 // inferIndex returns the index of this activator slice.
