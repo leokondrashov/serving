@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -45,7 +46,10 @@ type throttledTwoLaneQueue struct {
 	name string
 
 	fastChan chan interface{}
+	fastRL   *workqueue.BucketRateLimiter
 	slowChan chan interface{}
+	slowRL   *workqueue.BucketRateLimiter
+	// consumerAvailability chan struct{}
 
 	logger *zap.SugaredLogger
 }
@@ -55,37 +59,46 @@ func newThrottledTwoLaneWorkQueue(name string, rl workqueue.RateLimiter, logger 
 
 	queue_rps, _ := strconv.ParseFloat(os.Getenv("Queue_Throttle"), 64)
 	burst, _ := strconv.ParseInt(os.Getenv("Queue_Burst"), 10, 32)
+	ratio, _ := strconv.ParseFloat(os.Getenv("Queue_Ratio"), 64)
 
 	tlq := &throttledTwoLaneQueue{
 		RateLimitingInterface: workqueue.NewNamedRateLimitingQueue(
 			rl,
 			name+"-fast",
 		),
+		fastRL: &workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(queue_rps*ratio), int(float64(burst)*ratio))},
 		slowLane: workqueue.NewNamedRateLimitingQueue(
 			rl,
 			name+"-slow",
 		),
+		slowRL: &workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(queue_rps*(1-ratio)), int(float64(burst)*(1-ratio)))},
 		consumerQueue: workqueue.NewNamedRateLimitingQueue(
 			&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(queue_rps), int(burst))},
 			name+"-consumer",
 		),
 		name:     name,
-		fastChan: make(chan interface{}, 1),
-		slowChan: make(chan interface{}, 1),
-		logger:   logger,
+		fastChan: make(chan interface{}),
+		slowChan: make(chan interface{}),
+		// consumerAvailability: make(chan struct{}, 1),
+		logger: logger,
 	}
 	// Run consumer thread.
+	// tlq.consumerAvailability <- struct{}{}
 	go tlq.runConsumer()
 	// Run producer threads.
-	go process(tlq.RateLimitingInterface, tlq.fastChan)
-	go process(tlq.slowLane, tlq.slowChan)
+	go process(tlq.RateLimitingInterface, tlq.fastChan, tlq.fastRL)
+	go process(tlq.slowLane, tlq.slowChan, tlq.slowRL)
 	return tlq
 }
 
-func process(q workqueue.Interface, ch chan interface{}) {
+func process(q workqueue.Interface, ch chan interface{}, rl *workqueue.BucketRateLimiter) {
 	// Sender closes the channel
 	defer close(ch)
 	for {
+		res := rl.Reserve()
+		if res.Delay() > 0 {
+			time.Sleep(res.Delay())
+		}
 		i, d := q.Get()
 		// If the queue is empty and we're shutting down — stop the loop.
 		if d {
@@ -106,6 +119,7 @@ func (tlq *throttledTwoLaneQueue) runConsumer() {
 		// By default drain the fast lane.
 		// Channels in select are picked random, so first
 		// we have a select that only looks at the fast lane queue.
+		// <-tlq.consumerAvailability
 		if fast {
 			select {
 			case item, ok := <-tlq.fastChan:
@@ -172,6 +186,7 @@ func (tlq *throttledTwoLaneQueue) ShutDown() {
 // didn't originate the object.
 func (tlq *throttledTwoLaneQueue) Done(i interface{}) {
 	tlq.consumerQueue.Done(i)
+	// tlq.consumerAvailability <- struct{}{}
 }
 
 // Get implements workqueue.Interface.

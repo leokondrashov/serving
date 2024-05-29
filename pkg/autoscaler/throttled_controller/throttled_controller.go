@@ -298,6 +298,18 @@ func (c *Impl) EnqueueSlowKey(key types.NamespacedName) {
 	}
 }
 
+// EnqueueSlowKeyAfter takes a resource, converts it into a namespace/name string,
+// and enqueues that key in the slow lane.
+func (c *Impl) EnqueueSlowKeyAfter(key types.NamespacedName, delay time.Duration) {
+	c.workQueue.SlowLane().AddAfter(key, delay)
+
+	if logger := c.logger.Desugar(); logger.Core().Enabled(zapcore.DebugLevel) {
+		logger.Debug(fmt.Sprintf("Adding to the slow queue %s (delay: %v depth(total/slow): %d/%d)",
+			safeKey(key), delay, c.workQueue.Len(), c.workQueue.SlowLane().Len()),
+			zap.String(logkey.Key, key.String()))
+	}
+}
+
 // EnqueueSlow extracts namespaced name from the object and enqueues it on the slow
 // work queue.
 func (c *Impl) EnqueueSlow(obj interface{}) {
@@ -451,6 +463,18 @@ func (c *Impl) MaybeEnqueueBucketKey(bkt reconciler.Bucket, key types.Namespaced
 // EnqueueKeyAfter takes a namespace/name string and schedules its execution in
 // the work queue after given delay.
 func (c *Impl) EnqueueKeyAfter(key types.NamespacedName, delay time.Duration) {
+	if key.Name != "" {
+		components := strings.Split(key.Name, "-")
+		if len(components) >= 3 {
+			thirdComponent := components[2]
+			num, err := strconv.Atoi(thirdComponent)
+			if err == nil && num%2 != 0 {
+				c.EnqueueSlowKeyAfter(key, delay)
+				return
+			}
+		}
+	}
+
 	c.workQueue.AddAfter(key, delay)
 
 	if logger := c.logger.Desugar(); logger.Core().Enabled(zapcore.DebugLevel) {
