@@ -251,13 +251,12 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 	// We didn't manage to reserve a spot. We need to create a new instance and wait for its creation
 	rt.cr.Poke()
 	wakeupSignal := make(chan struct{}, 1)
-	defer close(wakeupSignal)
 	rt.queue <- wakeupSignal
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-wakeupSignal:
-		rt.logger.Debugf("Request is woken up", rt.revID)
+		rt.logger.Debugf("Request is woken up %s", rt.revID)
 	}
 
 	tracker := <-rt.newTrackers
@@ -377,8 +376,9 @@ func (rt *revisionThrottler) updateCapacity(backendCount int, deleted, added []*
 		for _, t := range added {
 			rt.logger.Debugf("Pushing tracker %s as a new instance", t.dest)
 			if len(rt.queue) > 0 {
+				wakeUpChannel := <-rt.queue
 				select {
-				case (<-rt.queue) <- struct{}{}:
+				case wakeUpChannel <- struct{}{}:
 					// We have requests waiting for capacity, so we can signal them.
 					rt.newTrackers <- t
 				default: // executed if we have a dead request in the queue
@@ -389,6 +389,7 @@ func (rt *revisionThrottler) updateCapacity(backendCount int, deleted, added []*
 					})
 					rt.assignedTrackers = assigned
 				}
+				close(wakeUpChannel)
 			} else {
 				rt.logger.Debug("No requests waiting for capacity, adding tracker directly")
 				assigned := append(rt.assignedTrackers, t)
