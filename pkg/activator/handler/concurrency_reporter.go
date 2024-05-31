@@ -158,7 +158,7 @@ func (cr *ConcurrencyReporter) report(now time.Time) []asmetrics.StatMessage {
 		for _, key := range toDelete {
 			// Avoid deleting the stat if a request raced fetching it while we've been
 			// busy reporting.
-			if cr.stats[key].refs.Load() == 0 {
+			if cr.stats[key] != nil && cr.stats[key].refs.Load() == 0 {
 				delete(cr.stats, key)
 			}
 		}
