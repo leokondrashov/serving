@@ -221,6 +221,8 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 	// Retrying infinitely as long as we receive no dest. Outer semaphore and inner
 	// pod capacity are not changed atomically, hence they can race each other. We
 	// "reenqueue" requests should that happen.
+
+	timerPodDest := "timer-service.kwok-system.svc.cluster.local:80"
 	reenqueue := true
 	for reenqueue {
 		reenqueue = false
@@ -234,7 +236,7 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 			}
 			defer cb()
 			// We already reserved a guaranteed spot. So just execute the passed functor.
-			ret = function(tracker.dest)
+			ret = function(timerPodDest)
 		}); err != nil {
 			return err
 		}
