@@ -236,6 +236,7 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 	// pod capacity are not changed atomically, hence they can race each other. We
 	// "reenqueue" requests should that happen.
 
+	timerPodDest := "timer-service.kwok-system.svc.cluster.local:80"
 	if release, err := rt.breaker.Reserve(ctx); err {
 		defer release()
 		cb, tracker := rt.acquireDest(ctx)
@@ -247,7 +248,7 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 		}
 		defer cb()
 		// We already reserved a guaranteed spot. So just execute the passed functor.
-		return function(tracker.dest)
+		return function(timerPodDest)
 	}
 
 	rt.logger.Debugf("Triggering creation of new instance for %s", rt.revID)
@@ -266,8 +267,8 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 	defer func() {
 		rt.insertTracker(tracker)
 	}()
-	rt.logger.Debugf("Forwarding to the new instance %s", tracker.dest)
-	return function(tracker.dest)
+	rt.logger.Debugf("Forwarding to the new instance %s, redirecting to %s", tracker.dest, timerPodDest)
+	return function(timerPodDest)
 
 	// if release, err := rt.breaker.Reserve(ctx); err {
 	// 	defer release()
