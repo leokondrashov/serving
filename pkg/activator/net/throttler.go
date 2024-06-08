@@ -19,8 +19,11 @@ package net
 import (
 	"context"
 	"net/http"
+	"os"
 	"sort"
+	"strconv"
 	"sync"
+	"time"
 
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -148,7 +151,8 @@ type revisionThrottler struct {
 	backendCount int
 
 	// This is a breaker for the revision as a whole.
-	breaker breaker
+	breaker       breaker
+	marginBreaker breaker
 
 	// This will be non-empty when we're able to use pod addressing.
 	podTrackers []*podTracker
@@ -166,10 +170,14 @@ type revisionThrottler struct {
 	mux sync.RWMutex
 
 	logger *zap.SugaredLogger
+
+	margin     float64
+	localDelay int
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
 	containerConcurrency int, proto string,
+	margin float64, localDelay int,
 	breakerParams queue.BreakerParams,
 	logger *zap.SugaredLogger) *revisionThrottler {
 	logger = logger.With(zap.String(logkey.Key, revID.String()))
@@ -190,14 +198,18 @@ func newRevisionThrottler(revID types.NamespacedName,
 		revBreaker = queue.NewBreaker(breakerParams)
 		lbp = newRoundRobinPolicy()
 	}
+
 	return &revisionThrottler{
 		revID:                revID,
 		containerConcurrency: containerConcurrency,
 		breaker:              revBreaker,
+		marginBreaker:        queue.NewBreaker(breakerParams),
 		logger:               logger,
 		protocol:             proto,
 		activatorIndex:       *atomic.NewInt32(-1), // Start with unknown.
 		lbPolicy:             lbp,
+		margin:               margin,
+		localDelay:           localDelay,
 	}
 }
 
@@ -216,32 +228,56 @@ func (rt *revisionThrottler) acquireDest(ctx context.Context) (func(), *podTrack
 }
 
 func (rt *revisionThrottler) try(ctx context.Context, function func(string) error) error {
-	var ret error
-
 	// Retrying infinitely as long as we receive no dest. Outer semaphore and inner
 	// pod capacity are not changed atomically, hence they can race each other. We
 	// "reenqueue" requests should that happen.
 
 	timerPodDest := "timer-service.kwok-system.svc.cluster.local:80"
-	reenqueue := true
-	for reenqueue {
-		reenqueue = false
-		if err := rt.breaker.Maybe(ctx, func() {
-			cb, tracker := rt.acquireDest(ctx)
-			if tracker == nil {
-				// This can happen if individual requests raced each other or if pod
-				// capacity was decreased after passing the outer semaphore.
-				reenqueue = true
-				return
-			}
-			defer cb()
-			// We already reserved a guaranteed spot. So just execute the passed functor.
-			ret = function(timerPodDest)
-		}); err != nil {
-			return err
+
+	// case I: we have available instance, just go through.
+	if release, err := rt.breaker.Reserve(ctx); err {
+		defer release()
+		cb, tracker := rt.acquireDest(ctx)
+		if tracker == nil {
+			// This can happen if individual requests raced each other or if pod
+			// capacity was decreased after passing the outer semaphore.
+			rt.logger.Fatalf("No tracker available for revision %s", rt.revID)
+			return nil
 		}
+		defer cb()
+		// We already reserved a guaranteed spot. So just execute the passed functor.
+		return function(timerPodDest)
 	}
-	return ret
+
+	// case II: we have no available instance, try to squeeze into the margin
+	if release, err := rt.marginBreaker.Reserve(ctx); err {
+		defer release()
+		reenqueue := true
+		var ret error
+		for reenqueue {
+			reenqueue = false
+			if err := rt.breaker.Maybe(ctx, func() {
+				cb, tracker := rt.acquireDest(ctx)
+				if tracker == nil {
+					// This can happen if individual requests raced each other or if pod
+					// capacity was decreased after passing the outer semaphore.
+					reenqueue = true
+					return
+				}
+				defer cb()
+				// We already reserved a guaranteed spot. So just execute the passed functor.
+				ret = function(timerPodDest)
+			}); err != nil {
+				return err
+			}
+		}
+		return ret
+	}
+
+	// case III: we have no available instance, try to do with local expansion
+	rt.logger.Debug("Running local scaling for revision")
+	time.Sleep(time.Duration(rt.localDelay) * time.Millisecond)
+	return function(timerPodDest)
 }
 
 func (rt *revisionThrottler) calculateCapacity(backendCount, numTrackers, activatorCount int) int {
@@ -327,6 +363,7 @@ func (rt *revisionThrottler) updateCapacity(backendCount int) {
 
 	rt.backendCount = backendCount
 	rt.breaker.UpdateConcurrency(capacity)
+	rt.marginBreaker.UpdateConcurrency(int(float64(capacity) * rt.margin))
 }
 
 func (rt *revisionThrottler) updateThrottlerState(backendCount int, trackers []*podTracker, clusterIPDest *podTracker) {
@@ -457,17 +494,45 @@ type Throttler struct {
 	ipAddress               string // The IP address of this activator.
 	logger                  *zap.SugaredLogger
 	epsUpdateCh             chan *corev1.Endpoints
+	margin                  float64
+	localDelay              int
 }
 
 // NewThrottler creates a new Throttler
 func NewThrottler(ctx context.Context, ipAddr string) *Throttler {
 	revisionInformer := revisioninformer.Get(ctx)
+
+	logger := logging.FromContext(ctx)
+
+	marginValue := 0.3
+	if val, ok := os.LookupEnv("CONCURRENCY_MARGIN"); ok {
+		m, err := strconv.ParseFloat(val, 64)
+		if err != nil {
+			logger.Infof("failed to parse value %q of CONCURRENCY_MARGIN: %v, defaulting to 0.3\n", val, err)
+		}
+		marginValue = m
+	} else {
+		logger.Infof("missing value of CONCURRENCY_MARGIN, defaulting to 0.3\n")
+	}
+	localDelay := 60
+	if val, ok := os.LookupEnv("LOCAL_DELAY"); ok {
+		d, err := strconv.Atoi(val)
+		if err != nil {
+			logger.Infof("failed to parse value %q of LOCAL_DELAY: %v, defaulting to 60ms\n", val, err)
+		}
+		localDelay = d
+	} else {
+		logger.Infof("missing value of LOCAL_DELAY, defaulting to 60ms\n")
+	}
+
 	t := &Throttler{
 		revisionThrottlers: make(map[types.NamespacedName]*revisionThrottler),
 		revisionLister:     revisionInformer.Lister(),
 		ipAddress:          ipAddr,
-		logger:             logging.FromContext(ctx),
+		logger:             logger,
 		epsUpdateCh:        make(chan *corev1.Endpoints),
+		margin:             marginValue,
+		localDelay:         localDelay,
 	}
 
 	// Watch revisions to create throttler with backlog immediately and delete
@@ -547,6 +612,8 @@ func (t *Throttler) getOrCreateRevisionThrottler(revID types.NamespacedName) (*r
 			revID,
 			int(rev.Spec.GetContainerConcurrency()),
 			pkgnet.ServicePortName(rev.GetProtocol()),
+			t.margin,
+			t.localDelay,
 			queue.BreakerParams{QueueDepth: breakerQueueDepth, MaxConcurrency: revisionMaxConcurrency},
 			t.logger,
 		)
