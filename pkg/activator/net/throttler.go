@@ -31,8 +31,12 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+	metricsv "k8s.io/metrics/pkg/client/clientset/versioned"
 
 	pkgnet "knative.dev/networking/pkg/apis/networking"
 	netcfg "knative.dev/networking/pkg/config"
@@ -173,13 +177,15 @@ type revisionThrottler struct {
 
 	margin     float64
 	localDelay int
+	nodes      []NodeStatus
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
 	containerConcurrency int, proto string,
 	margin float64, localDelay int,
 	breakerParams queue.BreakerParams,
-	logger *zap.SugaredLogger) *revisionThrottler {
+	logger *zap.SugaredLogger,
+	nodes []NodeStatus) *revisionThrottler {
 	logger = logger.With(zap.String(logkey.Key, revID.String()))
 	var (
 		revBreaker breaker
@@ -210,6 +216,7 @@ func newRevisionThrottler(revID types.NamespacedName,
 		lbPolicy:             lbp,
 		margin:               margin,
 		localDelay:           localDelay,
+		nodes:                nodes,
 	}
 }
 
@@ -275,9 +282,44 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 	}
 
 	// case III: we have no available instance, try to do with local expansion
-	rt.logger.Debug("Running local scaling for revision")
-	time.Sleep(time.Duration(rt.localDelay) * time.Millisecond)
-	return function(timerPodDest)
+	node := rt.chooseNode()
+	if node != "" {
+		rt.logger.Debug("Running local scaling on node", node)
+		time.Sleep(time.Duration(rt.localDelay) * time.Millisecond)
+		return function(timerPodDest)
+	}
+
+	// case IV: we have no free resources on the nodes, just wait in the queue
+	rt.logger.Debug("No resources available, waiting in the main queue")
+	reenqueue := true
+	var ret error
+	for reenqueue {
+		reenqueue = false
+		if err := rt.breaker.Maybe(ctx, func() {
+			cb, tracker := rt.acquireDest(ctx)
+			if tracker == nil {
+				// This can happen if individual requests raced each other or if pod
+				// capacity was decreased after passing the outer semaphore.
+				reenqueue = true
+				return
+			}
+			defer cb()
+			// We already reserved a guaranteed spot. So just execute the passed functor.
+			ret = function(timerPodDest)
+		}); err != nil {
+			return err
+		}
+	}
+	return ret
+}
+
+func (rt *revisionThrottler) chooseNode() string {
+	for _, n := range rt.nodes {
+		if n.cpuUtil < 0.8*n.cpuCapacity {
+			return n.name
+		}
+	}
+	return ""
 }
 
 func (rt *revisionThrottler) calculateCapacity(backendCount, numTrackers, activatorCount int) int {
@@ -485,6 +527,12 @@ func (rt *revisionThrottler) handleUpdate(update revisionDestsUpdate) {
 	rt.updateThrottlerState(len(update.Dests), nil /*trackers*/, newPodTracker(update.ClusterIPDest, nil))
 }
 
+type NodeStatus struct {
+	name        string
+	cpuUtil     float64
+	cpuCapacity float64
+}
+
 // Throttler load balances requests to revisions based on capacity. When `Run` is called it listens for
 // updates to revision backends and decides when and when and where to forward a request.
 type Throttler struct {
@@ -496,6 +544,7 @@ type Throttler struct {
 	epsUpdateCh             chan *corev1.Endpoints
 	margin                  float64
 	localDelay              int
+	nodes                   []NodeStatus
 }
 
 // NewThrottler creates a new Throttler
@@ -525,6 +574,8 @@ func NewThrottler(ctx context.Context, ipAddr string) *Throttler {
 		logger.Infof("missing value of LOCAL_DELAY, defaulting to 60ms\n")
 	}
 
+	nodes := getNodes(ctx)
+
 	t := &Throttler{
 		revisionThrottlers: make(map[types.NamespacedName]*revisionThrottler),
 		revisionLister:     revisionInformer.Lister(),
@@ -533,6 +584,7 @@ func NewThrottler(ctx context.Context, ipAddr string) *Throttler {
 		epsUpdateCh:        make(chan *corev1.Endpoints),
 		margin:             marginValue,
 		localDelay:         localDelay,
+		nodes:              nodes,
 	}
 
 	// Watch revisions to create throttler with backlog immediately and delete
@@ -556,6 +608,79 @@ func NewThrottler(ctx context.Context, ipAddr string) *Throttler {
 		},
 	})
 	return t
+}
+
+func getNodes(ctx context.Context) []NodeStatus {
+	logger := logging.FromContext(ctx)
+	restConfig, err := rest.InClusterConfig()
+	if err != nil {
+		logger.Fatalf("Error building in-cluster config: %s\n", err.Error())
+	}
+
+	// Create the metrics clientset
+	metricsClientset, err := metricsv.NewForConfig(restConfig)
+	if err != nil {
+		logger.Fatalf("Error creating metrics clientset: %s\n", err.Error())
+	}
+
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		logger.Fatalf("Error creating clientset: %s\n", err.Error())
+	}
+
+	// Get the node metrics
+	nodeMetrics, err := metricsClientset.MetricsV1beta1().NodeMetricses().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		logger.Fatalf("Error getting node metrics: %s\n", err.Error())
+	}
+
+	// Print the CPU usage for each node
+	nodes := make([]NodeStatus, len(nodeMetrics.Items))
+	for _, m := range nodeMetrics.Items {
+		if m.Labels["loader-nodetype"] != "worker" {
+			continue
+		}
+
+		node, err := clientset.CoreV1().Nodes().Get(context.TODO(), m.Name, metav1.GetOptions{})
+		if err != nil {
+			logger.Fatalf("Error getting node details: %s\n", err.Error())
+		}
+
+		cpuCapacity := node.Status.Capacity.Cpu().AsApproximateFloat64()
+		cpuUsage := m.Usage.Cpu().AsApproximateFloat64()
+		nodes = append(nodes, NodeStatus{name: m.Name, cpuUtil: cpuUsage, cpuCapacity: cpuCapacity})
+	}
+
+	go func() {
+		refresh := time.NewTicker(time.Second * 15)
+		for {
+			select {
+			case <-refresh.C:
+				nodeMetrics, err := metricsClientset.MetricsV1beta1().NodeMetricses().List(context.TODO(), metav1.ListOptions{})
+				if err != nil {
+					logger.Fatalf("Error getting node metrics: %s\n", err.Error())
+				}
+
+				for _, m := range nodeMetrics.Items {
+					if m.Labels["loader-nodetype"] != "worker" {
+						continue
+					}
+
+					cpuUsage := m.Usage.Cpu().AsApproximateFloat64()
+					for i, n := range nodes {
+						if n.name == m.Name {
+							nodes[i].cpuUtil = cpuUsage
+						}
+					}
+				}
+			case <-ctx.Done():
+				return
+			}
+
+		}
+	}()
+
+	return nodes
 }
 
 // Run starts the throttler and blocks until the context is done.
@@ -616,6 +741,7 @@ func (t *Throttler) getOrCreateRevisionThrottler(revID types.NamespacedName) (*r
 			t.localDelay,
 			queue.BreakerParams{QueueDepth: breakerQueueDepth, MaxConcurrency: revisionMaxConcurrency},
 			t.logger,
+			t.nodes,
 		)
 		t.revisionThrottlers[revID] = revThrottler
 	}
