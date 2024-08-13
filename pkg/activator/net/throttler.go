@@ -158,6 +158,9 @@ type revisionThrottler struct {
 	// This is a subset of podTrackers.
 	assignedTrackers []*podTracker
 
+	// Trackers that need to be discarded as soon as they finish their request.
+	toDelete []*podTracker
+
 	// newly created instances first handle the held requests before being included into the pool.
 	newTrackers chan *podTracker
 
@@ -261,6 +264,14 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 
 	tracker := <-rt.newTrackers
 	defer func() {
+		for i, t := range rt.toDelete {
+			if t == tracker {
+				rt.logger.Debugf("Skipping tracker %s as it was deleted", tracker.dest)
+				rt.toDelete = append(rt.toDelete[i:], rt.toDelete[i+1:]...)
+
+				return
+			}
+		}
 		rt.insertTracker(tracker)
 	}()
 	rt.logger.Debugf("Forwarding to the new instance %s", tracker.dest)
@@ -368,9 +379,15 @@ func (rt *revisionThrottler) updateCapacity(backendCount int, deleted, added []*
 			} else if rt.assignedTrackers[i].dest < deleted[i_del].dest {
 				i++
 			} else {
-				rt.logger.Errorf("Deleting non-existing tracker %s", deleted[i_del].dest)
+				rt.logger.Debugf("Deleting non-existing tracker %s", deleted[i_del].dest)
+				rt.toDelete = append(rt.toDelete, deleted[i_del])
 				i_del++
 			}
+		}
+
+		for ; i_del < len(deleted); i_del++ {
+			rt.logger.Debugf("Deleting non-existing tracker %s", deleted[i_del].dest)
+			rt.toDelete = append(rt.toDelete, deleted[i_del])
 		}
 
 		for _, t := range added {
