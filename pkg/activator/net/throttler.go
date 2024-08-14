@@ -264,14 +264,6 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 
 	tracker := <-rt.newTrackers
 	defer func() {
-		for i, t := range rt.toDelete {
-			if t == tracker {
-				rt.logger.Debugf("Skipping tracker %s as it was deleted", tracker.dest)
-				rt.toDelete = append(rt.toDelete[i:], rt.toDelete[i+1:]...)
-
-				return
-			}
-		}
 		rt.insertTracker(tracker)
 	}()
 	rt.logger.Debugf("Forwarding to the new instance %s", tracker.dest)
@@ -379,8 +371,8 @@ func (rt *revisionThrottler) updateCapacity(backendCount int, deleted, added []*
 			} else if rt.assignedTrackers[i].dest < deleted[i_del].dest {
 				i++
 			} else {
-				rt.logger.Debugf("Deleting non-existing tracker %s", deleted[i_del].dest)
 				rt.toDelete = append(rt.toDelete, deleted[i_del])
+				rt.logger.Debugf("Deleting non-existing tracker %s, to delete %v", deleted[i_del].dest, rt.toDelete)
 				i_del++
 			}
 		}
@@ -433,6 +425,15 @@ func (rt *revisionThrottler) insertTracker(tracker *podTracker) {
 	numTrackers := func() int {
 		rt.mux.Lock()
 		defer rt.mux.Unlock()
+		for i, t := range rt.toDelete {
+			if t == tracker {
+				rt.toDelete = append(rt.toDelete[:i], rt.toDelete[i+1:]...)
+				rt.logger.Debugf("Skipping tracker %s as it was deleted, to delete %v", tracker.dest, rt.toDelete)
+
+				return len(rt.assignedTrackers)
+			}
+		}
+
 		assigned := append(rt.assignedTrackers, tracker)
 		sort.Slice(assigned, func(i, j int) bool {
 			return assigned[i].dest < assigned[j].dest
