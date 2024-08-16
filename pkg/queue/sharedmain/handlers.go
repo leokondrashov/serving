@@ -43,7 +43,7 @@ func mainHandler(
 	prober func() bool,
 	stats *netstats.RequestStats,
 	logger *zap.SugaredLogger,
-) (http.Handler, *pkghandler.Drainer) {
+) (http.Handler, *pkghandler.Drainer, *queue.Breaker) {
 	target := net.JoinHostPort("127.0.0.1", env.UserPort)
 
 	httpProxy := pkghttp.NewHeaderPruningReverseProxy(target, pkghttp.NoHostOverride, activator.RevisionHeaders, false /* use HTTP */)
@@ -100,7 +100,7 @@ func mainHandler(
 		// Hence we need to have RequestLogHandler be the first one.
 		composedHandler = requestLogHandler(logger, composedHandler, env)
 	}
-	return composedHandler, drainer
+	return composedHandler, drainer, breaker
 }
 
 func adminHandler(ctx context.Context, logger *zap.SugaredLogger, drainer *pkghandler.Drainer) http.Handler {

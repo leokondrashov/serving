@@ -59,7 +59,7 @@ const (
 	// Duration the /wait-for-drain handler should wait before returning.
 	// This is to give networking a little bit more time to remove the pod
 	// from its configuration and propagate that to all loadbalancers and nodes.
-	drainSleepDuration = 30 * time.Second
+	drainSleepDuration = 1 * time.Second
 
 	// certPath is the path for the server certificate mounted by queue-proxy.
 	certPath = queue.CertDirectory + "/" + certificates.CertName
@@ -233,7 +233,7 @@ func Main(opts ...Option) error {
 	// Enable TLS when certificate is mounted.
 	tlsEnabled := exists(logger, certPath) && exists(logger, keyPath)
 
-	mainHandler, drainer := mainHandler(d.Ctx, env, d.Transport, probe, stats, logger)
+	mainHandler, drainer, breaker := mainHandler(d.Ctx, env, d.Transport, probe, stats, logger)
 	adminHandler := adminHandler(d.Ctx, logger, drainer)
 
 	// Enable TLS server when activator server certs are mounted.
@@ -304,6 +304,12 @@ func Main(opts ...Option) error {
 		logger.Info("Received TERM signal, attempting to gracefully shutdown servers.")
 		logger.Infof("Sleeping %v to allow K8s propagation of non-ready state", drainSleepDuration)
 		drainer.Drain()
+
+		// wait for requests to finish
+		logger.Info("Draining the connections.")
+		for breaker.InFlight() > 0 {
+			time.Sleep(1 * time.Second)
+		}
 
 		for name, srv := range httpServers {
 			logger.Info("Shutting down server: ", name)
