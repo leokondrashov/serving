@@ -110,7 +110,7 @@ func NewImpl(ctx context.Context, r Interface, classValue string, optionsFns ...
 		zap.String(logkey.Kind, "autoscaling.internal.knative.dev.PodAutoscaler"),
 	)
 
-	impl := controller.NewContext(ctx, rec, controller.ControllerOptions{WorkQueueName: ctrTypeName, Logger: logger})
+	impl := controller.NewContext(ctx, rec, controller.ControllerOptions{WorkQueueName: ctrTypeName, Logger: logger, Concurrency: 100})
 	agentName := defaultControllerAgentName
 
 	// Pass impl to the options. Save any optional results.
