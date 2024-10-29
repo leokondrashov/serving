@@ -155,12 +155,19 @@ func (a *autoscaler) Scale(logger *zap.SugaredLogger, now time.Time) ScaleResult
 
 	metricName := spec.ScalingMetric
 	var observedStableValue, observedPanicValue float64
-	switch spec.ScalingMetric {
-	case autoscaling.RPS:
-		observedStableValue, observedPanicValue, err = a.metricClient.StableAndPanicRPS(metricKey, now)
-	default:
-		metricName = autoscaling.Concurrency // concurrency is used by default
-		observedStableValue, observedPanicValue, err = a.metricClient.StableAndPanicConcurrency(metricKey, now)
+	maxObservedValue := 0.
+	for i := 0; i < int(tickInterval/time.Second); i++ {
+		switch spec.ScalingMetric {
+		case autoscaling.RPS:
+			observedStableValue, observedPanicValue, err = a.metricClient.StableAndPanicRPS(metricKey, now.Add(time.Duration(i)*time.Second))
+		default:
+			metricName = autoscaling.Concurrency // concurrency is used by default
+			observedStableValue, observedPanicValue, err = a.metricClient.StableAndPanicConcurrency(metricKey, now)
+		}
+
+		if maxObservedValue < observedStableValue {
+			maxObservedValue = observedStableValue
+		}
 	}
 
 	if err != nil {
@@ -184,13 +191,13 @@ func (a *autoscaler) Scale(logger *zap.SugaredLogger, now time.Time) ScaleResult
 		maxScaleDown = math.Floor(readyPodsCount / spec.MaxScaleDownRate)
 	}
 
-	dspc := math.Ceil(observedStableValue / spec.TargetValue)
+	dspc := math.Ceil(maxObservedValue)
 	dppc := 0.0 // math.Ceil(observedPanicValue / spec.TargetValue)
 	if debugEnabled {
 		desugared.Debug(
 			fmt.Sprintf("For metric %s observed values: stable = %0.3f; panic = %0.3f; target = %0.3f "+
 				"Desired StablePodCount = %0.0f, PanicPodCount = %0.0f, ReadyEndpointCount = %d, MaxScaleUp = %0.0f, MaxScaleDown = %0.0f",
-				metricName, observedStableValue, observedPanicValue, spec.TargetValue,
+				metricName, maxObservedValue, observedPanicValue, spec.TargetValue,
 				dspc, dppc, originalReadyPodsCount, maxScaleUp, maxScaleDown))
 	}
 

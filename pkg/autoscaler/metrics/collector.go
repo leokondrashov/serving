@@ -268,7 +268,7 @@ func newCollection(metric *autoscalingv1alpha1.Metric, scraper StatsScraper, clo
 	// NB: this relies on the fact that aggregation algorithm is set on annotation of revision
 	// and as such is immutable.
 	bucketCtor := func(w time.Duration, g time.Duration) windowAverager {
-		return aggregation.NewTimedFloat64Buckets(w, g)
+		return aggregation.NewLinearRegressBuckets(w, g)
 	}
 	if metric.AggregationAlgorithm() == autoscaling.MetricAggregationAlgorithmWeightedExponential {
 		bucketCtor = func(w time.Duration, g time.Duration) windowAverager {

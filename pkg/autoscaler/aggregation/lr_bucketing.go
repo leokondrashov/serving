@@ -47,13 +47,13 @@ func NewLinearRegressBuckets(window, granularity time.Duration) *LinearRegressBu
 	// Number of buckets is `window` divided by `granularity`, rounded up.
 	// e.g. 60s / 2s = 30.
 	nb := math.Ceil(float64(window) / float64(granularity))
-	weigth := make([]float64, int(nb))
+	weight := make([]float64, int(nb))
 	for i := 0; i < int(nb); i++ {
-		weigth[i] = 1.0 / nb
+		weight[i] = 1.0 / nb
 	}
 	return &LinearRegressBuckets{
 		buckets:     make([]float64, int(nb)),
-		weights:     weigth,
+		weights:     weight,
 		granularity: granularity,
 		window:      window,
 	}
@@ -62,32 +62,33 @@ func NewLinearRegressBuckets(window, granularity time.Duration) *LinearRegressBu
 func (b *LinearRegressBuckets) Record(now time.Time, value float64) {
 	bucketTime := now.Truncate(b.granularity)
 
-	predValue := b.WindowAverage(now)
+	predValue := math.Max(0., math.Ceil(b.WindowAverage(now)))
 	b.bucketsMutex.Lock()
 	defer b.bucketsMutex.Unlock()
 
+	// Update the weights
 	if !b.isEmptyLocked(now) {
 		totalB := len(b.buckets)
 		numB := len(b.buckets)
 
-		// We start with 0es. But we know that we have _some_ data because
-		// IsEmpty returned false.
+		// Skip invalid buckets
 		numZ := 0
 		if now.After(b.lastWrite) {
 			numZ = int(now.Sub(b.lastWrite) / b.granularity)
-			// Reduce effective number of buckets.
+			// Reduce effective number of buckets
 			numB -= numZ
 		}
 		diff := predValue - value
 		startIdx := b.timeToIndex(b.lastWrite) + totalB // To ensure always positive % operation.
 		for i := 0; i < numB; i++ {
 			effectiveIdx := (startIdx - i) % totalB
-			b.weights[i] -= lr * diff * b.buckets[effectiveIdx]
+			b.weights[i] -= lr * diff * b.buckets[effectiveIdx] // Update rule
 		}
 	}
 
 	writeIdx := b.timeToIndex(now)
 
+	// Record new value
 	if b.lastWrite != bucketTime {
 		if bucketTime.Add(b.window).After(b.lastWrite) {
 			// If it is the first write or it happened before the first write which we
@@ -174,6 +175,8 @@ func (b *LinearRegressBuckets) ResizeWindow(w time.Duration) {
 	b.weights = newWeights
 }
 
+// Misnomer, but needs to be this way to be consistent with the interface
+// Does the weighted sum <=> Linear Regression
 func (b *LinearRegressBuckets) WindowAverage(now time.Time) float64 {
 	now = now.Truncate(b.granularity)
 	b.bucketsMutex.RLock()
