@@ -2,13 +2,24 @@ package aggregation
 
 import (
 	"math"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 )
 
-const (
+var (
 	lr = 0.01
 )
+
+func init() {
+	lrEnv := os.Getenv("LR")
+	if lrEnv != "" {
+		if lrValue, err := strconv.ParseFloat(lrEnv, 64); err == nil {
+			lr = lrValue
+		}
+	}
+}
 
 type (
 	LinearRegressBuckets struct {
