@@ -172,10 +172,6 @@ func main() {
 		transport = pkgnet.NewProxyAutoTLSTransport(env.MaxIdleProxyConns, env.MaxIdleProxyConnsPerHost, certCache.TLSContext())
 	}
 
-	// Start throttler.
-	throttler := activatornet.NewThrottler(ctx, env.PodIP)
-	go throttler.Run(ctx, transport, networkConfig.EnableMeshPodAddressability, networkConfig.MeshCompatibilityMode)
-
 	oct := tracing.NewOpenCensusTracer(tracing.WithExporterFull(networking.ActivatorServiceName, env.PodIP, logger))
 	defer oct.Shutdown(context.Background())
 
@@ -205,6 +201,10 @@ func main() {
 	// Create and run our concurrency reporter
 	concurrencyReporter := activatorhandler.NewConcurrencyReporter(ctx, env.PodName, statCh)
 	go concurrencyReporter.Run(ctx.Done())
+
+	// Start throttler.
+	throttler := activatornet.NewThrottler(ctx, env.PodIP, concurrencyReporter)
+	go throttler.Run(ctx, transport, networkConfig.EnableMeshPodAddressability, networkConfig.MeshCompatibilityMode)
 
 	// Create activation handler chain
 	// Note: innermost handlers are specified first, ie. the last handler in the chain will be executed first

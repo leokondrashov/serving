@@ -28,7 +28,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
 	pkgnet "knative.dev/networking/pkg/apis/networking"
@@ -39,6 +42,7 @@ import (
 	"knative.dev/pkg/logging"
 	"knative.dev/pkg/logging/logkey"
 	"knative.dev/pkg/reconciler"
+	"knative.dev/serving/pkg/activator/handler"
 	"knative.dev/serving/pkg/apis/serving"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	revisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/revision"
@@ -165,13 +169,20 @@ type revisionThrottler struct {
 	// request path. This is: trackers, clusterIPDest.
 	mux sync.RWMutex
 
+	cr *handler.ConcurrencyReporter
+
 	logger *zap.SugaredLogger
+
+	nodes   []string
+	nodeIdx int
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
 	containerConcurrency int, proto string,
 	breakerParams queue.BreakerParams,
-	logger *zap.SugaredLogger) *revisionThrottler {
+	logger *zap.SugaredLogger,
+	cr *handler.ConcurrencyReporter,
+	nodes []string) *revisionThrottler {
 	logger = logger.With(zap.String(logkey.Key, revID.String()))
 	var (
 		revBreaker breaker
@@ -198,6 +209,8 @@ func newRevisionThrottler(revID types.NamespacedName,
 		protocol:             proto,
 		activatorIndex:       *atomic.NewInt32(-1), // Start with unknown.
 		lbPolicy:             lbp,
+		cr:                   cr,
+		nodes:                nodes,
 	}
 }
 
@@ -216,30 +229,46 @@ func (rt *revisionThrottler) acquireDest(ctx context.Context) (func(), *podTrack
 }
 
 func (rt *revisionThrottler) try(ctx context.Context, function func(string) error) error {
-	var ret error
-
 	// Retrying infinitely as long as we receive no dest. Outer semaphore and inner
 	// pod capacity are not changed atomically, hence they can race each other. We
 	// "reenqueue" requests should that happen.
-	reenqueue := true
-	for reenqueue {
-		reenqueue = false
-		if err := rt.breaker.Maybe(ctx, func() {
-			cb, tracker := rt.acquireDest(ctx)
-			if tracker == nil {
-				// This can happen if individual requests raced each other or if pod
-				// capacity was decreased after passing the outer semaphore.
-				reenqueue = true
-				return
-			}
-			defer cb()
-			// We already reserved a guaranteed spot. So just execute the passed functor.
-			ret = function(tracker.dest)
-		}); err != nil {
-			return err
+	if release, err := rt.breaker.Reserve(ctx); err {
+		defer release()
+		cb, tracker := rt.acquireDest(ctx)
+		if tracker == nil {
+			// This can happen if individual requests raced each other or if pod
+			// capacity was decreased after passing the outer semaphore.
+			rt.logger.Fatalf("No tracker available for revision %s", rt.revID)
+			return nil
 		}
+		defer cb()
+		// We already reserved a guaranteed spot. So just execute the passed functor.
+		return function(tracker.dest)
 	}
-	return ret
+
+	rt.logger.Debugf("Triggering creation of new instance for %s", rt.revID)
+	// We didn't manage to reserve a spot. Will use the local expansion and kick-off the creation in background
+	rt.cr.Poke()
+
+	tracker := rt.nodes[rt.nodeIdx]
+	rt.nodeIdx = (rt.nodeIdx + 1) % len(rt.nodes)
+	return function(tracker + ":8080")
+
+	// if release, err := rt.breaker.Reserve(ctx); err {
+	// 	defer release()
+	// 	cb, tracker := rt.acquireDest(ctx)
+	// 	if tracker == nil {
+	// 		// This can happen if individual requests raced each other or if pod
+	// 		// capacity was decreased after passing the outer semaphore.
+	// 		rt.logger.Fatalf("No tracker available for revision %s", rt.revID)
+	// 		return nil
+	// 	}
+	// 	defer cb()
+	// 	// We already reserved a guaranteed spot. So just execute the passed functor.
+	// 	return function(tracker.dest)
+	// } else {
+	// 	rt.logger.Fatalf("Not able to get instance for %s", rt.revID)
+	// }
 }
 
 func (rt *revisionThrottler) calculateCapacity(backendCount, numTrackers, activatorCount int) int {
@@ -455,10 +484,13 @@ type Throttler struct {
 	ipAddress               string // The IP address of this activator.
 	logger                  *zap.SugaredLogger
 	epsUpdateCh             chan *corev1.Endpoints
+	cr                      *handler.ConcurrencyReporter
+
+	nodes []string
 }
 
 // NewThrottler creates a new Throttler
-func NewThrottler(ctx context.Context, ipAddr string) *Throttler {
+func NewThrottler(ctx context.Context, ipAddr string, cr *handler.ConcurrencyReporter) *Throttler {
 	revisionInformer := revisioninformer.Get(ctx)
 	t := &Throttler{
 		revisionThrottlers: make(map[types.NamespacedName]*revisionThrottler),
@@ -466,6 +498,8 @@ func NewThrottler(ctx context.Context, ipAddr string) *Throttler {
 		ipAddress:          ipAddr,
 		logger:             logging.FromContext(ctx),
 		epsUpdateCh:        make(chan *corev1.Endpoints),
+		cr:                 cr,
+		nodes:              getNodes(ctx),
 	}
 
 	// Watch revisions to create throttler with backlog immediately and delete
@@ -489,6 +523,45 @@ func NewThrottler(ctx context.Context, ipAddr string) *Throttler {
 		},
 	})
 	return t
+}
+
+func getNodes(ctx context.Context) []string {
+	logger := logging.FromContext(ctx)
+	restConfig, err := rest.InClusterConfig()
+	if err != nil {
+		logger.Fatalf("Error building in-cluster config: %s\n", err.Error())
+	}
+
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		logger.Fatalf("Error creating clientset: %s\n", err.Error())
+	}
+
+	// Get the node list
+	nodeList, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		logger.Fatalf("Error getting node list: %s\n", err.Error())
+	}
+
+	// Print the CPU usage for each node
+	nodes := []string{}
+	for _, n := range nodeList.Items {
+		if n.Labels["loader-nodetype"] != "worker" && n.Labels["loader-nodetype"] != "singlenode" {
+			continue
+		}
+
+		var ip string
+		for _, addr := range n.Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP {
+				ip = addr.Address
+				break
+			}
+		}
+		nodes = append(nodes, ip)
+	}
+
+	logger.Infof("Nodes: %v", nodes)
+	return nodes
 }
 
 // Run starts the throttler and blocks until the context is done.
@@ -547,6 +620,8 @@ func (t *Throttler) getOrCreateRevisionThrottler(revID types.NamespacedName) (*r
 			pkgnet.ServicePortName(rev.GetProtocol()),
 			queue.BreakerParams{QueueDepth: breakerQueueDepth, MaxConcurrency: revisionMaxConcurrency},
 			t.logger,
+			t.cr,
+			t.nodes,
 		)
 		t.revisionThrottlers[revID] = revThrottler
 	}
