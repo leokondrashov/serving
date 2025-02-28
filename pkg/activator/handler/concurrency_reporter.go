@@ -82,22 +82,10 @@ func NewConcurrencyReporter(ctx context.Context, podName string, statCh chan []a
 // handleRequestIn handles an event of a request coming into the system. Returns the stats
 // the outgoing event should be recorded to.
 func (cr *ConcurrencyReporter) handleRequestIn(event netstats.ReqEvent) *revisionStats {
-	stat, msg := cr.getOrCreateStat(event)
+	stat, _ := cr.getOrCreateStat(event)
 	stat.stats.HandleEvent(event)
-	if msg == nil {
-		report := stat.stats.Report(time.Now())
-		msg = &asmetrics.StatMessage{
-			Key: event.Key,
-			Stat: asmetrics.Stat{
-				PodName:                   cr.podName,
-				AverageConcurrentRequests: report.AverageConcurrency,
-				ConcurrentRequests:        report.Concurrency,
-				RequestCount:              report.RequestCount,
-			},
-		}
-	}
 
-	cr.statCh <- []asmetrics.StatMessage{*msg}
+	// cr.statCh <- []asmetrics.StatMessage{*msg}
 	return stat
 }
 
@@ -149,6 +137,7 @@ func (cr *ConcurrencyReporter) getOrCreateStat(event netstats.ReqEvent) (*revisi
 			PodName:                   cr.podName,
 			AverageConcurrentRequests: 1,
 			ConcurrentRequests:        1,
+			MaxConcurrentRequests:     1,
 			// The way the checks are written, this cannot ever be
 			// anything else but 1. The stats map key is only deleted
 			// after a reporting period, so we see this code path at most
@@ -206,6 +195,7 @@ func (cr *ConcurrencyReporter) computeReport(now time.Time) (msgs []asmetrics.St
 				PodName:                   cr.podName,
 				AverageConcurrentRequests: adjustedConcurrency,
 				ConcurrentRequests:        report.Concurrency,
+				MaxConcurrentRequests:     report.MaxConcurrency,
 				RequestCount:              adjustedCount,
 			},
 		})
@@ -265,5 +255,13 @@ func (cr *ConcurrencyReporter) Handler(next http.Handler) http.HandlerFunc {
 		}()
 
 		next.ServeHTTP(w, r)
+	}
+}
+
+func (cr *ConcurrencyReporter) Poke() {
+	msgs := cr.report(time.Now())
+
+	if len(msgs) > 0 {
+		cr.statCh <- msgs
 	}
 }
