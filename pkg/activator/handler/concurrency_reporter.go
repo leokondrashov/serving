@@ -20,6 +20,8 @@ import (
 	"context"
 	"math"
 	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -64,11 +66,23 @@ type ConcurrencyReporter struct {
 	mux sync.RWMutex
 	// This map holds the concurrency and request count accounting across revisions.
 	stats map[types.NamespacedName]*revisionStats
+
+	lastInvTime   map[types.NamespacedName]time.Time
+	cooldown      time.Duration
+	alwaysTrigger bool
 }
 
 // NewConcurrencyReporter creates a ConcurrencyReporter which listens to incoming
 // ReqEvents on reqCh and ticks on reportCh and reports stats on statCh.
 func NewConcurrencyReporter(ctx context.Context, podName string, statCh chan []asmetrics.StatMessage) *ConcurrencyReporter {
+	cooldown, err := strconv.ParseInt(os.Getenv("IAT_THRESHOLD"), 10, 32)
+	if err != nil {
+		cooldown = 60
+	}
+	alwaysTrigger, err := strconv.ParseBool(os.Getenv("ALWAYS_TRIGGER"))
+	if err != nil {
+		alwaysTrigger = false
+	}
 	return &ConcurrencyReporter{
 		logger:  logging.FromContext(ctx),
 		podName: podName,
@@ -76,6 +90,10 @@ func NewConcurrencyReporter(ctx context.Context, podName string, statCh chan []a
 		rl:      revisioninformer.Get(ctx).Lister(),
 
 		stats: make(map[types.NamespacedName]*revisionStats),
+
+		lastInvTime:   make(map[types.NamespacedName]time.Time),
+		cooldown:      time.Duration(cooldown) * time.Second,
+		alwaysTrigger: alwaysTrigger,
 	}
 }
 
@@ -249,10 +267,18 @@ func (cr *ConcurrencyReporter) Handler(next http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		revisionKey := RevIDFrom(r.Context())
 
-		stat := cr.handleRequestIn(netstats.ReqEvent{Key: revisionKey, Type: netstats.ReqIn, Time: time.Now()})
-		defer func() {
-			cr.handleRequestOut(stat, netstats.ReqEvent{Key: revisionKey, Type: netstats.ReqOut, Time: time.Now()})
-		}()
+		cr.mux.RLock()
+		prev, ok := cr.lastInvTime[revisionKey]
+		cr.mux.RUnlock()
+		if cr.alwaysTrigger || (ok && (time.Since(prev) < cr.cooldown)) {
+			stat := cr.handleRequestIn(netstats.ReqEvent{Key: revisionKey, Type: netstats.ReqIn, Time: time.Now()})
+			defer func() {
+				cr.handleRequestOut(stat, netstats.ReqEvent{Key: revisionKey, Type: netstats.ReqOut, Time: time.Now()})
+			}()
+		}
+		cr.mux.Lock()
+		cr.lastInvTime[revisionKey] = time.Now()
+		cr.mux.Unlock()
 
 		next.ServeHTTP(w, r)
 	}
