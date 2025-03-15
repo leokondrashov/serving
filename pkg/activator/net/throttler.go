@@ -252,7 +252,7 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 
 	rt.logger.Debugf("Triggering creation of new instance for %s", rt.revID)
 	// We didn't manage to reserve a spot. We need to create a new instance and wait for its creation
-	rt.cr.Poke()
+	rt.cr.Poke(rt.revID)
 	wakeupSignal := make(chan struct{}, 1)
 	rt.queue <- wakeupSignal
 	select {
