@@ -167,38 +167,46 @@ func (cr *ConcurrencyReporter) report(now time.Time) []asmetrics.StatMessage {
 	return msgs
 }
 
+// Do the report for a single revision
+// Call inside cr.mux lock
+func (cr *ConcurrencyReporter) SingleReport(now time.Time, key types.NamespacedName) (*asmetrics.StatMessage, bool) {
+	stat := cr.stats[key]
+	if stat == nil {
+		return nil, true
+	}
+	report := stat.stats.Report(now)
+
+	firstAdj := stat.firstRequest
+	stat.firstRequest = 0.
+
+	// Subtract the request we already reported when first seeing the
+	// revision. We report a min of 0 here because the initial report is
+	// always a concurrency of 1 and the actual concurrency reported over
+	// the reporting period might be < 1.
+	adjustedConcurrency := math.Max(report.AverageConcurrency-firstAdj, 0)
+	adjustedCount := report.RequestCount - firstAdj
+	return &asmetrics.StatMessage{
+		Key: key,
+		Stat: asmetrics.Stat{
+			PodName:                   cr.podName,
+			AverageConcurrentRequests: adjustedConcurrency,
+			ConcurrentRequests:        report.Concurrency,
+			MaxConcurrentRequests:     report.MaxConcurrency,
+			RequestCount:              adjustedCount,
+		},
+	}, report.AverageConcurrency == 0
+}
+
 func (cr *ConcurrencyReporter) computeReport(now time.Time) (msgs []asmetrics.StatMessage, toDelete []types.NamespacedName) {
 	cr.mux.RLock()
 	defer cr.mux.RUnlock()
 	msgs = make([]asmetrics.StatMessage, 0, len(cr.stats))
-	for key, stat := range cr.stats {
-		report := stat.stats.Report(now)
-
-		firstAdj := stat.firstRequest
-		stat.firstRequest = 0.
-
-		// This is only 0 if we have seen no activity for the entire reporting
-		// period at all.
-		if report.AverageConcurrency == 0 {
+	for key, _ := range cr.stats {
+		mgs, del := cr.SingleReport(now, key)
+		msgs = append(msgs, *mgs)
+		if del {
 			toDelete = append(toDelete, key)
 		}
-
-		// Subtract the request we already reported when first seeing the
-		// revision. We report a min of 0 here because the initial report is
-		// always a concurrency of 1 and the actual concurrency reported over
-		// the reporting period might be < 1.
-		adjustedConcurrency := math.Max(report.AverageConcurrency-firstAdj, 0)
-		adjustedCount := report.RequestCount - firstAdj
-		msgs = append(msgs, asmetrics.StatMessage{
-			Key: key,
-			Stat: asmetrics.Stat{
-				PodName:                   cr.podName,
-				AverageConcurrentRequests: adjustedConcurrency,
-				ConcurrentRequests:        report.Concurrency,
-				MaxConcurrentRequests:     report.MaxConcurrency,
-				RequestCount:              adjustedCount,
-			},
-		})
 	}
 
 	return msgs, toDelete
@@ -258,10 +266,13 @@ func (cr *ConcurrencyReporter) Handler(next http.Handler) http.HandlerFunc {
 	}
 }
 
-func (cr *ConcurrencyReporter) Poke() {
-	msgs := cr.report(time.Now())
+func (cr *ConcurrencyReporter) Poke(key types.NamespacedName) bool {
+	cr.mux.RLock()
+	defer cr.mux.RUnlock()
+	msg, _ := cr.SingleReport(time.Now(), key)
 
-	if len(msgs) > 0 {
-		cr.statCh <- msgs
+	if msg != nil {
+		cr.statCh <- []asmetrics.StatMessage{*msg}
 	}
+	return msg != nil
 }
