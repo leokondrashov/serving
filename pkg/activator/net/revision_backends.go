@@ -167,6 +167,9 @@ func (rw *revisionWatcher) probe(ctx context.Context, dest string) (pass bool, n
 		Path:   nethttp.HealthCheckPath,
 	}
 
+	rw.logger.Debugf("Skipping probing %s", dest)
+	return true, false, nil
+
 	// We don't want to unnecessarily fall back to ClusterIP if we see a failure
 	// that could not have been caused by the mesh being enabled.
 	var checkMesh netprober.Verifier = func(resp *http.Response, _ []byte) (bool, error) {

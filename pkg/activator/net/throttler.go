@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"time"
 
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -232,6 +233,8 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 	// Retrying infinitely as long as we receive no dest. Outer semaphore and inner
 	// pod capacity are not changed atomically, hence they can race each other. We
 	// "reenqueue" requests should that happen.
+
+	timerPodDest := "timer-service.kwok-system.svc.cluster.local:80"
 	if release, err := rt.breaker.Reserve(ctx); err {
 		defer release()
 		cb, tracker := rt.acquireDest(ctx)
@@ -243,16 +246,17 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 		}
 		defer cb()
 		// We already reserved a guaranteed spot. So just execute the passed functor.
-		return function(tracker.dest)
+		return function(timerPodDest)
 	}
 
 	rt.logger.Debugf("Triggering creation of new instance for %s", rt.revID)
 	// We didn't manage to reserve a spot. Will use the local expansion and kick-off the creation in background
 	rt.cr.Poke()
 
-	tracker := rt.nodes[rt.nodeIdx]
-	rt.nodeIdx = (rt.nodeIdx + 1) % len(rt.nodes)
-	return function(tracker + ":8080")
+	tmpTimerPodDest := "timer-service-tmp.kwok-system.svc.cluster.local:80"
+	rt.logger.Debugf("Forwarding to the temp instance %s, redirecting to %s", tmpTimerPodDest)
+	time.Sleep(100 * time.Millisecond)
+	return function(tmpTimerPodDest)
 
 	// if release, err := rt.breaker.Reserve(ctx); err {
 	// 	defer release()
