@@ -67,7 +67,8 @@ type ConcurrencyReporter struct {
 	// This map holds the concurrency and request count accounting across revisions.
 	stats map[types.NamespacedName]*revisionStats
 
-	lastInvTime   map[types.NamespacedName]time.Time
+	firstInvTime  map[types.NamespacedName]time.Time
+	count         map[types.NamespacedName]int32
 	cooldown      time.Duration
 	alwaysTrigger bool
 }
@@ -91,7 +92,7 @@ func NewConcurrencyReporter(ctx context.Context, podName string, statCh chan []a
 
 		stats: make(map[types.NamespacedName]*revisionStats),
 
-		lastInvTime:   make(map[types.NamespacedName]time.Time),
+		firstInvTime:  make(map[types.NamespacedName]time.Time),
 		cooldown:      time.Duration(cooldown) * time.Second,
 		alwaysTrigger: alwaysTrigger,
 	}
@@ -268,16 +269,20 @@ func (cr *ConcurrencyReporter) Handler(next http.Handler) http.HandlerFunc {
 		revisionKey := RevIDFrom(r.Context())
 
 		cr.mux.RLock()
-		prev, ok := cr.lastInvTime[revisionKey]
+		first, ok := cr.firstInvTime[revisionKey]
+		count := cr.count[revisionKey]
 		cr.mux.RUnlock()
-		if cr.alwaysTrigger || (ok && (time.Since(prev) < cr.cooldown)) {
+		if cr.alwaysTrigger || (ok && (time.Since(first)/time.Duration(count) < cr.cooldown)) {
 			stat := cr.handleRequestIn(netstats.ReqEvent{Key: revisionKey, Type: netstats.ReqIn, Time: time.Now()})
 			defer func() {
 				cr.handleRequestOut(stat, netstats.ReqEvent{Key: revisionKey, Type: netstats.ReqOut, Time: time.Now()})
 			}()
 		}
 		cr.mux.Lock()
-		cr.lastInvTime[revisionKey] = time.Now()
+		if !ok {
+			cr.firstInvTime[revisionKey] = time.Now()
+		}
+		cr.count[revisionKey]++
 		cr.mux.Unlock()
 
 		next.ServeHTTP(w, r)
