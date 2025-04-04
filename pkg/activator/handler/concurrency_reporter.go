@@ -93,6 +93,7 @@ func NewConcurrencyReporter(ctx context.Context, podName string, statCh chan []a
 		stats: make(map[types.NamespacedName]*revisionStats),
 
 		firstInvTime:  make(map[types.NamespacedName]time.Time),
+		count:         make(map[types.NamespacedName]int32),
 		cooldown:      time.Duration(cooldown) * time.Second,
 		alwaysTrigger: alwaysTrigger,
 	}
@@ -177,7 +178,7 @@ func (cr *ConcurrencyReporter) report(now time.Time) []asmetrics.StatMessage {
 		for _, key := range toDelete {
 			// Avoid deleting the stat if a request raced fetching it while we've been
 			// busy reporting.
-			if cr.stats[key].refs.Load() == 0 {
+			if cr.stats[key] != nil && cr.stats[key].refs.Load() == 0 {
 				delete(cr.stats, key)
 			}
 		}
@@ -272,6 +273,9 @@ func (cr *ConcurrencyReporter) Handler(next http.Handler) http.HandlerFunc {
 		first, ok := cr.firstInvTime[revisionKey]
 		count := cr.count[revisionKey]
 		cr.mux.RUnlock()
+		if count != 0 {
+			cr.logger.Debugf("Observed IAT for %s: %v", revisionKey, time.Since(first)/time.Duration(count))
+		}
 		if cr.alwaysTrigger || (ok && (time.Since(first)/time.Duration(count) < cr.cooldown)) {
 			stat := cr.handleRequestIn(netstats.ReqEvent{Key: revisionKey, Type: netstats.ReqIn, Time: time.Now()})
 			defer func() {
@@ -281,8 +285,10 @@ func (cr *ConcurrencyReporter) Handler(next http.Handler) http.HandlerFunc {
 		cr.mux.Lock()
 		if !ok {
 			cr.firstInvTime[revisionKey] = time.Now()
+			cr.count[revisionKey] = 1
+		} else {
+			cr.count[revisionKey]++
 		}
-		cr.count[revisionKey]++
 		cr.mux.Unlock()
 
 		next.ServeHTTP(w, r)
