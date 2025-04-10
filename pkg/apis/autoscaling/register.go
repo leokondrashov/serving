@@ -140,7 +140,7 @@ const (
 	// isn't going to work well.
 	//
 	// nolint:revive // False positive, Min means minimum, not minutes.
-	WindowMin = 6 * time.Second
+	WindowMin = 1 * time.Second
 	// WindowMax is the maximum permitted stable autoscaling window.
 	// This keeps the event horizon to a reasonable enough limit.
 	WindowMax = 1 * time.Hour
