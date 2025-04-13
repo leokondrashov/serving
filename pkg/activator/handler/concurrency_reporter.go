@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,9 +68,8 @@ type ConcurrencyReporter struct {
 	// This map holds the concurrency and request count accounting across revisions.
 	stats map[types.NamespacedName]*revisionStats
 
-	firstInvTime  map[types.NamespacedName]time.Time
-	count         map[types.NamespacedName]int32
 	cooldown      time.Duration
+	percentile    int
 	alwaysTrigger bool
 }
 
@@ -84,6 +84,10 @@ func NewConcurrencyReporter(ctx context.Context, podName string, statCh chan []a
 	if err != nil {
 		alwaysTrigger = false
 	}
+	percentile, err := strconv.ParseInt(os.Getenv("PERCENTILE_TRIGGER"), 10, 32)
+	if err != nil {
+		percentile = 50
+	}
 	return &ConcurrencyReporter{
 		logger:  logging.FromContext(ctx),
 		podName: podName,
@@ -92,10 +96,9 @@ func NewConcurrencyReporter(ctx context.Context, podName string, statCh chan []a
 
 		stats: make(map[types.NamespacedName]*revisionStats),
 
-		firstInvTime:  make(map[types.NamespacedName]time.Time),
-		count:         make(map[types.NamespacedName]int32),
 		cooldown:      time.Duration(cooldown) * time.Second,
 		alwaysTrigger: alwaysTrigger,
+		percentile:    int(percentile),
 	}
 }
 
@@ -269,27 +272,19 @@ func (cr *ConcurrencyReporter) Handler(next http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		revisionKey := RevIDFrom(r.Context())
 
-		cr.mux.RLock()
-		first, ok := cr.firstInvTime[revisionKey]
-		count := cr.count[revisionKey]
-		cr.mux.RUnlock()
-		if count != 0 {
-			cr.logger.Debugf("Observed IAT for %s: %v", revisionKey, time.Since(first)/time.Duration(count))
+		funcNumStr := strings.Split(revisionKey.Name, "-")[2]
+		funcNum, err := strconv.Atoi(funcNumStr)
+		if err != nil {
+			cr.logger.Errorw("Error parsing function number", zap.String("revisionKey", revisionKey.Name), zap.Error(err))
+			funcNum = 0
 		}
-		if cr.alwaysTrigger || (ok && (time.Since(first)/time.Duration(count) < cr.cooldown)) {
+		pct, ok := dataMap[funcNum][cr.percentile]
+		if cr.alwaysTrigger || (ok && (time.Duration(pct*float64(time.Second)) < cr.cooldown)) {
 			stat := cr.handleRequestIn(netstats.ReqEvent{Key: revisionKey, Type: netstats.ReqIn, Time: time.Now()})
 			defer func() {
 				cr.handleRequestOut(stat, netstats.ReqEvent{Key: revisionKey, Type: netstats.ReqOut, Time: time.Now()})
 			}()
 		}
-		cr.mux.Lock()
-		if !ok {
-			cr.firstInvTime[revisionKey] = time.Now()
-			cr.count[revisionKey] = 1
-		} else {
-			cr.count[revisionKey]++
-		}
-		cr.mux.Unlock()
 
 		next.ServeHTTP(w, r)
 	}
