@@ -18,8 +18,11 @@ package net
 
 import (
 	"context"
+	"math/rand"
 	"net/http"
+	"os"
 	"sort"
+	"strconv"
 	"sync"
 
 	"go.uber.org/atomic"
@@ -173,8 +176,9 @@ type revisionThrottler struct {
 
 	logger *zap.SugaredLogger
 
-	nodes   []string
-	nodeIdx int
+	nodes        []string
+	nodeIdx      int
+	trafficSplit float64 // Traffic split between regular and emergency
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
@@ -182,7 +186,8 @@ func newRevisionThrottler(revID types.NamespacedName,
 	breakerParams queue.BreakerParams,
 	logger *zap.SugaredLogger,
 	cr *handler.ConcurrencyReporter,
-	nodes []string) *revisionThrottler {
+	nodes []string,
+	trafficSplit float64) *revisionThrottler {
 	logger = logger.With(zap.String(logkey.Key, revID.String()))
 	var (
 		revBreaker breaker
@@ -211,6 +216,7 @@ func newRevisionThrottler(revID types.NamespacedName,
 		lbPolicy:             lbp,
 		cr:                   cr,
 		nodes:                nodes,
+		trafficSplit:         trafficSplit,
 	}
 }
 
@@ -229,30 +235,40 @@ func (rt *revisionThrottler) acquireDest(ctx context.Context) (func(), *podTrack
 }
 
 func (rt *revisionThrottler) try(ctx context.Context, function func(string) error) error {
+	var ret error
+	if rand.Float64() < rt.trafficSplit {
+		tracker := rt.nodes[rt.nodeIdx]
+		rt.nodeIdx = (rt.nodeIdx + 1) % len(rt.nodes)
+		return function(tracker + ":8080")
+	}
+
 	// Retrying infinitely as long as we receive no dest. Outer semaphore and inner
 	// pod capacity are not changed atomically, hence they can race each other. We
 	// "reenqueue" requests should that happen.
-	if release, err := rt.breaker.Reserve(ctx); err {
-		defer release()
-		cb, tracker := rt.acquireDest(ctx)
-		if tracker == nil {
-			// This can happen if individual requests raced each other or if pod
-			// capacity was decreased after passing the outer semaphore.
-			rt.logger.Fatalf("No tracker available for revision %s", rt.revID)
-			return nil
+	reenqueue := true
+	for reenqueue {
+		reenqueue = false
+		if err := rt.breaker.Maybe(ctx, func() {
+			cb, tracker := rt.acquireDest(ctx)
+			if tracker == nil {
+				// This can happen if individual requests raced each other or if pod
+				// capacity was decreased after passing the outer semaphore.
+				reenqueue = true
+				return
+			}
+			defer cb()
+			// We already reserved a guaranteed spot. So just execute the passed functor.
+			ret = function(tracker.dest)
+		}); err != nil {
+			return err
 		}
-		defer cb()
-		// We already reserved a guaranteed spot. So just execute the passed functor.
-		return function(tracker.dest)
 	}
 
-	rt.logger.Debugf("Triggering creation of new instance for %s", rt.revID)
-	// We didn't manage to reserve a spot. Will use the local expansion and kick-off the creation in background
-	rt.cr.Poke()
+	return ret
 
-	tracker := rt.nodes[rt.nodeIdx]
-	rt.nodeIdx = (rt.nodeIdx + 1) % len(rt.nodes)
-	return function(tracker + ":8080")
+	// rt.logger.Debugf("Triggering creation of new instance for %s", rt.revID)
+	// // We didn't manage to reserve a spot. Will use the local expansion and kick-off the creation in background
+	// rt.cr.Poke()
 
 	// if release, err := rt.breaker.Reserve(ctx); err {
 	// 	defer release()
@@ -486,12 +502,17 @@ type Throttler struct {
 	epsUpdateCh             chan *corev1.Endpoints
 	cr                      *handler.ConcurrencyReporter
 
-	nodes []string
+	nodes        []string
+	trafficSplit float64 // Traffic split between regular and emergency
 }
 
 // NewThrottler creates a new Throttler
 func NewThrottler(ctx context.Context, ipAddr string, cr *handler.ConcurrencyReporter) *Throttler {
 	revisionInformer := revisioninformer.Get(ctx)
+	trafficSplit, err := strconv.ParseFloat(os.Getenv("TRAFFIC_SPLIT"), 64)
+	if err != nil {
+		trafficSplit = 0
+	}
 	t := &Throttler{
 		revisionThrottlers: make(map[types.NamespacedName]*revisionThrottler),
 		revisionLister:     revisionInformer.Lister(),
@@ -500,6 +521,7 @@ func NewThrottler(ctx context.Context, ipAddr string, cr *handler.ConcurrencyRep
 		epsUpdateCh:        make(chan *corev1.Endpoints),
 		cr:                 cr,
 		nodes:              getNodes(ctx),
+		trafficSplit:       trafficSplit,
 	}
 
 	// Watch revisions to create throttler with backlog immediately and delete
@@ -622,6 +644,7 @@ func (t *Throttler) getOrCreateRevisionThrottler(revID types.NamespacedName) (*r
 			t.logger,
 			t.cr,
 			t.nodes,
+			t.trafficSplit,
 		)
 		t.revisionThrottlers[revID] = revThrottler
 	}
