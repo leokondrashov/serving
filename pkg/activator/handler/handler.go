@@ -87,6 +87,31 @@ func (a *activationHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	revID := RevIDFrom(r.Context())
+	rev := RevisionFrom(r.Context())
+	if rev != nil && len(rev.Spec.Containers) > 0 {
+		image := rev.Spec.Containers[0].Image
+		args := rev.Spec.Containers[0].Args
+		env := rev.Spec.Containers[0].Env
+		if strings.Contains(image, "relay") {
+			relayArgs := rev.Spec.Containers[0].Args
+			r.Header.Set("relayArgs", strings.Join(relayArgs, " "))
+
+			image = rev.Spec.Containers[1].Image
+			args = rev.Spec.Containers[1].Args
+			env = rev.Spec.Containers[1].Env
+		} else {
+			r.Header.Set("args", strings.Join(rev.Spec.Containers[0].Args, " "))
+		}
+		r.Header.Set("image", image)
+		r.Header.Set("args", strings.Join(args, " "))
+		var envs []string
+		for _, v := range env {
+			envs = append(envs, v.Name+"="+v.Value)
+		}
+		r.Header.Set("env", strings.Join(envs, "|"))
+	}
+	r.Header.Set("revision", revID.Name)
+
 	if err := a.throttler.Try(tryContext, revID, func(dest string) error {
 		trySpan.End()
 
