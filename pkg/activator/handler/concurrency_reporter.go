@@ -272,7 +272,7 @@ func (cr *ConcurrencyReporter) Handler(next http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		revisionKey := RevIDFrom(r.Context())
 
-		funcNumStr := strings.Split(revisionKey.Name, "-")[2]
+		funcNumStr := strings.Split(revisionKey.Name, "-")[strings.Count(revisionKey.Name, "-")-2]
 		funcNum, err := strconv.Atoi(funcNumStr)
 		if err != nil {
 			cr.logger.Errorw("Error parsing function number", zap.String("revisionKey", revisionKey.Name), zap.Error(err))
