@@ -30,11 +30,14 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
+	metricsclientset "k8s.io/metrics/pkg/client/clientset/versioned"
 
 	pkgnet "knative.dev/networking/pkg/apis/networking"
 	netcfg "knative.dev/networking/pkg/config"
 	endpointsinformer "knative.dev/pkg/client/injection/kube/informers/core/v1/endpoints"
+	nodeinformer "knative.dev/pkg/client/injection/kube/informers/core/v1/node"
 	"knative.dev/pkg/controller"
+	"knative.dev/pkg/injection"
 	"knative.dev/pkg/kmeta"
 	"knative.dev/pkg/logging"
 	"knative.dev/pkg/logging/logkey"
@@ -171,7 +174,8 @@ type revisionThrottler struct {
 func newRevisionThrottler(revID types.NamespacedName,
 	containerConcurrency int, proto string,
 	breakerParams queue.BreakerParams,
-	logger *zap.SugaredLogger) *revisionThrottler {
+	logger *zap.SugaredLogger,
+	tracker *NodeUtilizationTracker) *revisionThrottler {
 	logger = logger.With(zap.String(logkey.Key, revID.String()))
 	var (
 		revBreaker breaker
@@ -184,7 +188,7 @@ func newRevisionThrottler(revID types.NamespacedName,
 	case containerConcurrency <= 3:
 		// For very low CC values use first available pod.
 		revBreaker = queue.NewBreaker(breakerParams)
-		lbp = newRoundRobinPolicy()
+		lbp = newCPUUtilizationLBPolicy(tracker)
 	default:
 		// Otherwise RR.
 		revBreaker = queue.NewBreaker(breakerParams)
@@ -455,17 +459,31 @@ type Throttler struct {
 	ipAddress               string // The IP address of this activator.
 	logger                  *zap.SugaredLogger
 	epsUpdateCh             chan *corev1.Endpoints
+	nodeUtilizationTracker  *NodeUtilizationTracker
 }
 
 // NewThrottler creates a new Throttler
 func NewThrottler(ctx context.Context, ipAddr string) *Throttler {
 	revisionInformer := revisioninformer.Get(ctx)
+	nodeInformer := nodeinformer.Get(ctx)
+	logger := logging.FromContext(ctx)
+
+	var metricsClient metricsclientset.Interface
+	if cfg := injection.GetConfig(ctx); cfg != nil {
+		var err error
+		metricsClient, err = metricsclientset.NewForConfig(cfg)
+		if err != nil {
+			logger.Errorw("Failed to create metrics client", zap.Error(err))
+		}
+	}
+
 	t := &Throttler{
-		revisionThrottlers: make(map[types.NamespacedName]*revisionThrottler),
-		revisionLister:     revisionInformer.Lister(),
-		ipAddress:          ipAddr,
-		logger:             logging.FromContext(ctx),
-		epsUpdateCh:        make(chan *corev1.Endpoints),
+		revisionThrottlers:     make(map[types.NamespacedName]*revisionThrottler),
+		revisionLister:         revisionInformer.Lister(),
+		ipAddress:              ipAddr,
+		logger:                 logger,
+		epsUpdateCh:            make(chan *corev1.Endpoints),
+		nodeUtilizationTracker: NewNodeUtilizationTracker(nodeInformer.Lister(), metricsClient, logger),
 	}
 
 	// Watch revisions to create throttler with backlog immediately and delete
@@ -547,6 +565,7 @@ func (t *Throttler) getOrCreateRevisionThrottler(revID types.NamespacedName) (*r
 			pkgnet.ServicePortName(rev.GetProtocol()),
 			queue.BreakerParams{QueueDepth: breakerQueueDepth, MaxConcurrency: revisionMaxConcurrency},
 			t.logger,
+			t.nodeUtilizationTracker,
 		)
 		t.revisionThrottlers[revID] = revThrottler
 	}

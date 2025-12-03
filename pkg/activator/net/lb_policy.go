@@ -21,6 +21,7 @@ package net
 import (
 	"context"
 	"math/rand"
+	"sort"
 	"sync"
 )
 
@@ -113,6 +114,34 @@ func newRoundRobinPolicy() lbPolicy {
 			}
 		}
 		// We exhausted all the options...
+		return noop, nil
+	}
+}
+
+func newCPUUtilizationLBPolicy(tracker *NodeUtilizationTracker) lbPolicy {
+	return func(ctx context.Context, targets []*podTracker) (func(), *podTracker) {
+		type candidate struct {
+			tracker     *podTracker
+			utilization float64
+		}
+
+		candidates := make([]candidate, 0, len(targets))
+		for _, t := range targets {
+			u := tracker.GetUtilization(t.dest)
+			candidates = append(candidates, candidate{t, u})
+		}
+
+		// Sort by utilization
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].utilization < candidates[j].utilization
+		})
+
+		for _, c := range candidates {
+			if cb, ok := c.tracker.Reserve(ctx); ok {
+				return cb, c.tracker
+			}
+		}
+
 		return noop, nil
 	}
 }

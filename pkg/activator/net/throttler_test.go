@@ -36,6 +36,7 @@ import (
 	pkgnet "knative.dev/networking/pkg/apis/networking"
 	fakekubeclient "knative.dev/pkg/client/injection/kube/client/fake"
 	fakeendpointsinformer "knative.dev/pkg/client/injection/kube/informers/core/v1/endpoints/fake"
+	_ "knative.dev/pkg/client/injection/kube/informers/core/v1/node/fake"
 	. "knative.dev/pkg/logging/testing"
 	rtesting "knative.dev/pkg/reconciler/testing"
 	"knative.dev/serving/pkg/apis/serving"
@@ -617,7 +618,7 @@ func TestPodAssignmentFinite(t *testing.T) {
 	defer cancel()
 
 	throttler := newTestThrottler(ctx)
-	rt := newRevisionThrottler(revName, 42 /*cc*/, pkgnet.ServicePortNameHTTP1, testBreakerParams, logger)
+	rt := newRevisionThrottler(revName, 42 /*cc*/, pkgnet.ServicePortNameHTTP1, testBreakerParams, logger, throttler.nodeUtilizationTracker)
 	rt.numActivators.Store(4)
 	rt.activatorIndex.Store(0)
 	throttler.revisionThrottlers[revName] = rt
@@ -669,7 +670,7 @@ func TestPodAssignmentInfinite(t *testing.T) {
 	defer cancel()
 
 	throttler := newTestThrottler(ctx)
-	rt := newRevisionThrottler(revName, 0 /*cc*/, pkgnet.ServicePortNameHTTP1, testBreakerParams, logger)
+	rt := newRevisionThrottler(revName, 0 /*cc*/, pkgnet.ServicePortNameHTTP1, testBreakerParams, logger, throttler.nodeUtilizationTracker)
 	throttler.revisionThrottlers[revName] = rt
 
 	update := revisionDestsUpdate{
@@ -900,7 +901,7 @@ func TestMultipleActivators(t *testing.T) {
 func TestInfiniteBreakerCreation(t *testing.T) {
 	// This test verifies that we use infiniteBreaker when CC==0.
 	tttl := newRevisionThrottler(types.NamespacedName{Namespace: "a", Name: "b"}, 0, /*cc*/
-		pkgnet.ServicePortNameHTTP1, queue.BreakerParams{}, TestLogger(t))
+		pkgnet.ServicePortNameHTTP1, queue.BreakerParams{}, TestLogger(t), nil)
 	if _, ok := tttl.breaker.(*infiniteBreaker); !ok {
 		t.Errorf("The type of revisionBreaker = %T, want %T", tttl, (*infiniteBreaker)(nil))
 	}
