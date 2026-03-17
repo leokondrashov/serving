@@ -18,12 +18,15 @@ package net
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"math/rand"
 	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -176,9 +179,10 @@ type revisionThrottler struct {
 
 	logger *zap.SugaredLogger
 
-	nodes        []string
-	nodeIdx      int
 	trafficSplit float64 // Traffic split between regular and emergency
+	nodeSelector func(types.NamespacedName, int) (string, int, bool)
+	nodeIdx      int
+	nodeMux      sync.Mutex
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
@@ -186,8 +190,8 @@ func newRevisionThrottler(revID types.NamespacedName,
 	breakerParams queue.BreakerParams,
 	logger *zap.SugaredLogger,
 	cr *handler.ConcurrencyReporter,
-	nodes []string,
-	trafficSplit float64) *revisionThrottler {
+	trafficSplit float64,
+	nodeSelector func(types.NamespacedName, int) (string, int, bool)) *revisionThrottler {
 	logger = logger.With(zap.String(logkey.Key, revID.String()))
 	var (
 		revBreaker breaker
@@ -215,8 +219,8 @@ func newRevisionThrottler(revID types.NamespacedName,
 		activatorIndex:       *atomic.NewInt32(-1), // Start with unknown.
 		lbPolicy:             lbp,
 		cr:                   cr,
-		nodes:                nodes,
 		trafficSplit:         trafficSplit,
+		nodeSelector:         nodeSelector,
 	}
 }
 
@@ -237,9 +241,21 @@ func (rt *revisionThrottler) acquireDest(ctx context.Context) (func(), *podTrack
 func (rt *revisionThrottler) try(ctx context.Context, function func(string) error) error {
 	var ret error
 	if rand.Float64() < rt.trafficSplit {
-		tracker := rt.nodes[rt.nodeIdx]
-		rt.nodeIdx = (rt.nodeIdx + 1) % len(rt.nodes)
-		return function(tracker + ":8080")
+		rt.nodeMux.Lock()
+		if rt.nodeSelector == nil {
+			rt.nodeMux.Unlock()
+			return fmt.Errorf("node selector is not configured for revision %s", rt.revID)
+		}
+		node, nextIdx, ok := rt.nodeSelector(rt.revID, rt.nodeIdx)
+		if ok {
+			rt.nodeIdx = nextIdx
+		}
+		rt.nodeMux.Unlock()
+		if !ok {
+			return fmt.Errorf("no candidate nodes available for revision %s", rt.revID)
+		}
+
+		return function(node + ":8080")
 	}
 
 	// Retrying infinitely as long as we receive no dest. Outer semaphore and inner
@@ -502,8 +518,11 @@ type Throttler struct {
 	epsUpdateCh             chan *corev1.Endpoints
 	cr                      *handler.ConcurrencyReporter
 
-	nodes        []string
 	trafficSplit float64 // Traffic split between regular and emergency
+	nodes        []string
+
+	nodeRevisionCache      map[string]sets.Set[string]
+	nodeRevisionCacheMutex sync.RWMutex
 }
 
 // NewThrottler creates a new Throttler
@@ -522,6 +541,7 @@ func NewThrottler(ctx context.Context, ipAddr string, cr *handler.ConcurrencyRep
 		cr:                 cr,
 		nodes:              getNodes(ctx),
 		trafficSplit:       trafficSplit,
+		nodeRevisionCache:  make(map[string]sets.Set[string]),
 	}
 
 	// Watch revisions to create throttler with backlog immediately and delete
@@ -586,8 +606,105 @@ func getNodes(ctx context.Context) []string {
 	return nodes
 }
 
+func (t *Throttler) startNodeRevisionPoller(ctx context.Context) {
+	if len(t.nodes) == 0 {
+		t.logger.Warn("Node revision poller skipped: node list is empty")
+		return
+	}
+
+	t.refreshNodeRevisionCache(ctx)
+
+	ticker := time.NewTicker(time.Second)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				t.refreshNodeRevisionCache(ctx)
+			}
+		}
+	}()
+}
+
+func (t *Throttler) refreshNodeRevisionCache(ctx context.Context) {
+	next := make(map[string]sets.Set[string], len(t.nodes))
+	for _, nodeIP := range t.nodes {
+		revisions, err := fetchNodeCachedRevisions(ctx, nodeIP)
+		if err != nil {
+			t.logger.Debugw("Failed to fetch cached working sets from node agent",
+				zap.String("nodeIP", nodeIP), zap.Error(err))
+			continue
+		}
+		next[nodeIP] = revisions
+		t.logger.Debugf("Fetched cached revisions for node %s: %v", nodeIP, revisions)
+	}
+
+	t.nodeRevisionCacheMutex.Lock()
+	t.nodeRevisionCache = next
+	t.nodeRevisionCacheMutex.Unlock()
+}
+
+func fetchNodeCachedRevisions(ctx context.Context, nodeIP string) (sets.Set[string], error) {
+	requestCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet,
+		fmt.Sprintf("http://%s:8081/cached-working-sets", nodeIP), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	var revisions []string
+	if err := json.NewDecoder(resp.Body).Decode(&revisions); err != nil {
+		return nil, err
+	}
+
+	result := make(sets.Set[string], len(revisions))
+	for _, revision := range revisions {
+		result.Insert(revision)
+	}
+	return result, nil
+}
+
+func (t *Throttler) pickNodeForRevision(revID types.NamespacedName, nodeIdx int) (string, int, bool) {
+	if len(t.nodes) == 0 {
+		return "", nodeIdx, false
+	}
+
+	preferred := make([]string, 0, len(t.nodes))
+	t.nodeRevisionCacheMutex.RLock()
+	for _, nodeIP := range t.nodes {
+		revisions := t.nodeRevisionCache[nodeIP]
+		if revisions != nil && revisions.Has(revID.Name) {
+			preferred = append(preferred, nodeIP)
+		}
+	}
+	t.nodeRevisionCacheMutex.RUnlock()
+
+	if len(preferred) > 0 {
+		idx := nodeIdx % len(preferred)
+		return preferred[idx], (idx + 1) % len(preferred), true
+	}
+
+	idx := nodeIdx % len(t.nodes)
+	return t.nodes[idx], (idx + 1) % len(t.nodes), true
+}
+
 // Run starts the throttler and blocks until the context is done.
 func (t *Throttler) Run(ctx context.Context, probeTransport http.RoundTripper, usePassthroughLb bool, meshMode netcfg.MeshCompatibilityMode) {
+	t.startNodeRevisionPoller(ctx)
 	rbm := newRevisionBackendsManager(ctx, probeTransport, usePassthroughLb, meshMode)
 	// Update channel is closed when ctx is done.
 	t.run(rbm.updates())
@@ -643,8 +760,8 @@ func (t *Throttler) getOrCreateRevisionThrottler(revID types.NamespacedName) (*r
 			queue.BreakerParams{QueueDepth: breakerQueueDepth, MaxConcurrency: revisionMaxConcurrency},
 			t.logger,
 			t.cr,
-			t.nodes,
 			t.trafficSplit,
+			t.pickNodeForRevision,
 		)
 		t.revisionThrottlers[revID] = revThrottler
 	}
