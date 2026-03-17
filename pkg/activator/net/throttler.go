@@ -25,6 +25,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -685,9 +686,10 @@ func (t *Throttler) pickNodeForRevision(revID types.NamespacedName, nodeIdx int)
 
 	preferred := make([]string, 0, len(t.nodes))
 	t.nodeRevisionCacheMutex.RLock()
+	revName := strings.Join(strings.Split(revID.Name, "-")[:len(strings.Split(revID.Name, "-"))-2], "-")
 	for _, nodeIP := range t.nodes {
 		revisions := t.nodeRevisionCache[nodeIP]
-		if revisions != nil && revisions.Has(revID.Name) {
+		if revisions != nil && revisions.Has(revName) {
 			preferred = append(preferred, nodeIP)
 		}
 	}
