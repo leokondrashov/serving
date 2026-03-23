@@ -188,7 +188,8 @@ func newRevisionThrottler(revID types.NamespacedName,
 	breakerParams queue.BreakerParams,
 	logger *zap.SugaredLogger,
 	cr *handler.ConcurrencyReporter,
-	nodeSelector func(types.NamespacedName, int) (string, int, bool)) *revisionThrottler {
+	nodeSelector func(types.NamespacedName, int) (string, int, bool),
+	nodeIdx int) *revisionThrottler {
 	logger = logger.With(zap.String(logkey.Key, revID.String()))
 	var (
 		revBreaker breaker
@@ -217,6 +218,7 @@ func newRevisionThrottler(revID types.NamespacedName,
 		lbPolicy:             lbp,
 		cr:                   cr,
 		nodeSelector:         nodeSelector,
+		nodeIdx:              nodeIdx,
 	}
 }
 
@@ -504,7 +506,9 @@ type Throttler struct {
 	epsUpdateCh             chan *corev1.Endpoints
 	cr                      *handler.ConcurrencyReporter
 
-	nodes                  []string
+	nodes   []string
+	nodeIdx int
+
 	nodeRevisionCache      map[string]sets.Set[string]
 	nodeRevisionCacheMutex sync.RWMutex
 }
@@ -521,6 +525,7 @@ func NewThrottler(ctx context.Context, ipAddr string, cr *handler.ConcurrencyRep
 		cr:                 cr,
 		nodes:              getNodes(ctx),
 		nodeRevisionCache:  make(map[string]sets.Set[string]),
+		nodeIdx:            0,
 	}
 
 	// Watch revisions to create throttler with backlog immediately and delete
@@ -741,7 +746,9 @@ func (t *Throttler) getOrCreateRevisionThrottler(revID types.NamespacedName) (*r
 			t.logger,
 			t.cr,
 			t.pickNodeForRevision,
+			t.nodeIdx,
 		)
+		t.nodeIdx++
 		t.revisionThrottlers[revID] = revThrottler
 	}
 	return revThrottler, nil
