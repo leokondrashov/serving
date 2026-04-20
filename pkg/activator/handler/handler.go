@@ -110,6 +110,7 @@ func (a *activationHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			envs = append(envs, v.Name+"="+v.Value)
 		}
 		r.Header.Set("env", strings.Join(envs, "|"))
+		r.Header.Set("port", strconv.Itoa(int(rev.Spec.Containers[0].Ports[0].ContainerPort)))
 	}
 	r.Header.Set("revision", revID.Name)
 
