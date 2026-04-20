@@ -23,6 +23,7 @@ import (
 	"net/http/httputil"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.opencensus.io/plugin/ochttp"
 	"go.opencensus.io/trace"
@@ -94,7 +95,10 @@ func (a *activationHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if tracingEnabled {
 			proxyCtx, proxySpan = trace.StartSpan(r.Context(), "activator_proxy")
 		}
+		startTime := time.Now()
+		w.Header().Set("Trailer", "function-delay")
 		a.proxyRequest(revID, w, r.WithContext(proxyCtx), dest, tracingEnabled, a.usePassthroughLb)
+		w.Header().Set("function-delay", strconv.Itoa(int(time.Since(startTime).Microseconds())))
 		proxySpan.End()
 
 		return nil
