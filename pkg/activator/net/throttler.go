@@ -19,7 +19,9 @@ package net
 import (
 	"context"
 	"net/http"
+	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -174,8 +176,9 @@ type revisionThrottler struct {
 
 	logger *zap.SugaredLogger
 
-	nodes   []string
-	nodeIdx int
+	nodes        []string
+	nodeIdx      int
+	restoreDelay int64
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
@@ -183,7 +186,8 @@ func newRevisionThrottler(revID types.NamespacedName,
 	breakerParams queue.BreakerParams,
 	logger *zap.SugaredLogger,
 	cr *handler.ConcurrencyReporter,
-	nodes []string) *revisionThrottler {
+	nodes []string,
+	restoreDelay int64) *revisionThrottler {
 	logger = logger.With(zap.String(logkey.Key, revID.String()))
 	var (
 		revBreaker breaker
@@ -212,6 +216,7 @@ func newRevisionThrottler(revID types.NamespacedName,
 		lbPolicy:             lbp,
 		cr:                   cr,
 		nodes:                nodes,
+		restoreDelay:         restoreDelay,
 	}
 }
 
@@ -255,7 +260,7 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 
 	tmpTimerPodDest := "timer-service-tmp.kwok-system.svc.cluster.local:80"
 	rt.logger.Debugf("Forwarding to the temp instance %s, redirecting to %s", tmpTimerPodDest)
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(time.Duration(rt.restoreDelay) * time.Millisecond)
 	return function(tmpTimerPodDest)
 
 	// if release, err := rt.breaker.Reserve(ctx); err {
@@ -490,12 +495,19 @@ type Throttler struct {
 	epsUpdateCh             chan *corev1.Endpoints
 	cr                      *handler.ConcurrencyReporter
 
-	nodes []string
+	nodes        []string
+	restoreDelay int64
 }
 
 // NewThrottler creates a new Throttler
 func NewThrottler(ctx context.Context, ipAddr string, cr *handler.ConcurrencyReporter) *Throttler {
 	revisionInformer := revisioninformer.Get(ctx)
+
+	restoreDelay, err := strconv.ParseInt(os.Getenv("RESTORE_DELAY_MS"), 10, 64)
+	if err != nil {
+		restoreDelay = 100
+	}
+
 	t := &Throttler{
 		revisionThrottlers: make(map[types.NamespacedName]*revisionThrottler),
 		revisionLister:     revisionInformer.Lister(),
@@ -504,6 +516,7 @@ func NewThrottler(ctx context.Context, ipAddr string, cr *handler.ConcurrencyRep
 		epsUpdateCh:        make(chan *corev1.Endpoints),
 		cr:                 cr,
 		nodes:              getNodes(ctx),
+		restoreDelay:       restoreDelay,
 	}
 
 	// Watch revisions to create throttler with backlog immediately and delete
@@ -626,6 +639,7 @@ func (t *Throttler) getOrCreateRevisionThrottler(revID types.NamespacedName) (*r
 			t.logger,
 			t.cr,
 			t.nodes,
+			t.restoreDelay,
 		)
 		t.revisionThrottlers[revID] = revThrottler
 	}
