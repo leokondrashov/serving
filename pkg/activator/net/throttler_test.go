@@ -26,6 +26,7 @@ import (
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/google/go-cmp/cmp"
+	"go.uber.org/atomic"
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,8 +39,10 @@ import (
 	fakeendpointsinformer "knative.dev/pkg/client/injection/kube/informers/core/v1/endpoints/fake"
 	. "knative.dev/pkg/logging/testing"
 	rtesting "knative.dev/pkg/reconciler/testing"
+	"knative.dev/serving/pkg/activator/handler"
 	"knative.dev/serving/pkg/apis/serving"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
+	asmetrics "knative.dev/serving/pkg/autoscaler/metrics"
 	fakeservingclient "knative.dev/serving/pkg/client/injection/client/fake"
 	revisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/revision"
 	fakerevisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/revision/fake"
@@ -58,8 +61,12 @@ type tryResult struct {
 	err  error
 }
 
+func newTestConcurrencyReporter(ctx context.Context) *handler.ConcurrencyReporter {
+	return handler.NewConcurrencyReporter(ctx, "activator", make(chan []asmetrics.StatMessage, 1))
+}
+
 func newTestThrottler(ctx context.Context) *Throttler {
-	return NewThrottler(ctx, "10.10.10.10")
+	return NewThrottler(ctx, "10.10.10.10", newTestConcurrencyReporter(ctx))
 }
 
 func TestThrottlerUpdateCapacity(t *testing.T) {
@@ -508,7 +515,7 @@ func TestThrottlerSuccesses(t *testing.T) {
 
 			updateCh := make(chan revisionDestsUpdate)
 
-			throttler := NewThrottler(ctx, "130.0.0.2")
+			throttler := NewThrottler(ctx, "130.0.0.2", newTestConcurrencyReporter(ctx))
 			var grp errgroup.Group
 			grp.Go(func() error { throttler.run(updateCh); return nil })
 			// Ensure the throttler stopped before we leave the test, so that
@@ -617,7 +624,7 @@ func TestPodAssignmentFinite(t *testing.T) {
 	defer cancel()
 
 	throttler := newTestThrottler(ctx)
-	rt := newRevisionThrottler(revName, 42 /*cc*/, pkgnet.ServicePortNameHTTP1, testBreakerParams, logger)
+	rt := newRevisionThrottler(revName, 42 /*cc*/, pkgnet.ServicePortNameHTTP1, testBreakerParams, logger, newTestConcurrencyReporter(ctx), newNodePool(nil))
 	rt.numActivators.Store(4)
 	rt.activatorIndex.Store(0)
 	throttler.revisionThrottlers[revName] = rt
@@ -669,7 +676,7 @@ func TestPodAssignmentInfinite(t *testing.T) {
 	defer cancel()
 
 	throttler := newTestThrottler(ctx)
-	rt := newRevisionThrottler(revName, 0 /*cc*/, pkgnet.ServicePortNameHTTP1, testBreakerParams, logger)
+	rt := newRevisionThrottler(revName, 0 /*cc*/, pkgnet.ServicePortNameHTTP1, testBreakerParams, logger, newTestConcurrencyReporter(ctx), newNodePool(nil))
 	throttler.revisionThrottlers[revName] = rt
 
 	update := revisionDestsUpdate{
@@ -728,7 +735,7 @@ func TestActivatorsIndexUpdate(t *testing.T) {
 
 	updateCh := make(chan revisionDestsUpdate)
 
-	throttler := NewThrottler(ctx, "130.0.0.2")
+	throttler := NewThrottler(ctx, "130.0.0.2", newTestConcurrencyReporter(ctx))
 	var grp errgroup.Group
 	grp.Go(func() error { throttler.run(updateCh); return nil })
 	// Ensure the throttler stopped before we leave the test, so that
@@ -823,7 +830,7 @@ func TestMultipleActivators(t *testing.T) {
 
 	updateCh := make(chan revisionDestsUpdate)
 
-	throttler := NewThrottler(ctx, "130.0.0.2")
+	throttler := NewThrottler(ctx, "130.0.0.2", newTestConcurrencyReporter(ctx))
 	var grp errgroup.Group
 	grp.Go(func() error { throttler.run(updateCh); return nil })
 	// Ensure the throttler stopped before we leave the test, so that
@@ -899,10 +906,101 @@ func TestMultipleActivators(t *testing.T) {
 
 func TestInfiniteBreakerCreation(t *testing.T) {
 	// This test verifies that we use infiniteBreaker when CC==0.
+	ctx, cancel, _ := rtesting.SetupFakeContextWithCancel(t)
+	defer cancel()
 	tttl := newRevisionThrottler(types.NamespacedName{Namespace: "a", Name: "b"}, 0, /*cc*/
-		pkgnet.ServicePortNameHTTP1, queue.BreakerParams{}, TestLogger(t))
+		pkgnet.ServicePortNameHTTP1, queue.BreakerParams{}, TestLogger(t), newTestConcurrencyReporter(ctx), newNodePool(nil))
 	if _, ok := tttl.breaker.(*infiniteBreaker); !ok {
 		t.Errorf("The type of revisionBreaker = %T, want %T", tttl, (*infiniteBreaker)(nil))
+	}
+}
+
+func TestNodePoolTryReserveEmpty(t *testing.T) {
+	np := newNodePool(nil)
+	if _, ok := np.tryReserve(); ok {
+		t.Error("tryReserve() on an empty pool should fail")
+	}
+}
+
+func TestNodeTrackerReserveNonPositiveLimit(t *testing.T) {
+	for _, limit := range []int32{0, -1} {
+		nt := &nodeTracker{ip: "10.0.0.1", limit: limit}
+		if nt.reserve() {
+			t.Errorf("reserve() with limit %d should fail", limit)
+		}
+		if got := nt.inFlight.Load(); got != 0 {
+			t.Errorf("inFlight = %d, want 0", got)
+		}
+	}
+}
+
+func TestNodePoolTryReserveRespectsLimit(t *testing.T) {
+	np := newNodePool([]*nodeTracker{
+		{ip: "10.0.0.1", limit: 2},
+		{ip: "10.0.0.2", limit: 1},
+	})
+
+	// Total capacity across the pool is 3: exhaust it, then confirm the
+	// 4th reservation fails.
+	var reserved []*nodeTracker
+	for i := 0; i < 3; i++ {
+		nt, ok := np.tryReserve()
+		if !ok {
+			t.Fatalf("tryReserve() #%d failed, want success", i)
+		}
+		reserved = append(reserved, nt)
+	}
+	if _, ok := np.tryReserve(); ok {
+		t.Error("tryReserve() succeeded after pool capacity was exhausted")
+	}
+
+	// Releasing one slot should make exactly one more reservation possible.
+	reserved[0].release()
+	if _, ok := np.tryReserve(); !ok {
+		t.Error("tryReserve() failed after releasing a slot, want success")
+	}
+	if _, ok := np.tryReserve(); ok {
+		t.Error("tryReserve() succeeded with no slots free")
+	}
+}
+
+func TestNodePoolTryReserveConcurrent(t *testing.T) {
+	const limit = 5
+	nodes := []*nodeTracker{
+		{ip: "10.0.0.1", limit: limit},
+		{ip: "10.0.0.2", limit: limit},
+		{ip: "10.0.0.3", limit: limit},
+	}
+	np := newNodePool(nodes)
+
+	const attempts = 200
+	var wg sync.WaitGroup
+	var succeeded atomic.Int32
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if nt, ok := np.tryReserve(); ok {
+				succeeded.Add(1)
+				// Simulate a brief in-flight request before releasing.
+				time.Sleep(time.Millisecond)
+				nt.release()
+			}
+		}()
+	}
+	wg.Wait()
+
+	// At any instant inFlight must never have exceeded limit; we can only
+	// verify the post-condition here (all slots released), so check that
+	// and that at least the total pool capacity worth of requests succeeded
+	// (more can succeed since slots are released and reused concurrently).
+	for _, nt := range nodes {
+		if got := nt.inFlight.Load(); got != 0 {
+			t.Errorf("node %s: inFlight = %d after all requests finished, want 0", nt.ip, got)
+		}
+	}
+	if got := succeeded.Load(); got < int32(len(nodes))*limit {
+		t.Errorf("succeeded = %d, want at least %d", got, len(nodes)*limit)
 	}
 }
 
