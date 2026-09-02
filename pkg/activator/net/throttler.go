@@ -191,16 +191,6 @@ func (np *nodePool) tryReserve() (*nodeTracker, bool) {
 	return nil, false
 }
 
-// waiterEntry represents one request blocked in revisionThrottler.queue,
-// waiting either for a specific new podTracker (direct hand-off) or a
-// clusterIP capacity broadcast (nil payload). taken is CAS-guarded to
-// resolve the race between a producer committing a value to ch and the
-// waiter giving up via ctx cancellation at the same instant.
-type waiterEntry struct {
-	ch    chan *podTracker // buffered size 1
-	taken atomic.Bool
-}
-
 // revisionThrottler is used to throttle requests across the entire revision.
 // We use a breaker across the entire revision as well as individual
 // podTrackers because we need to queue requests in case no individual
@@ -251,28 +241,20 @@ type revisionThrottler struct {
 	// *nodePool pointer for every revisionThrottler.
 	nodePool *nodePool
 
-	// claimedTrackers, toDelete and queue implement the wait-for-a-new-
-	// instance fallback (see try/wait/reconcileClaimed below). They are
-	// in-memory, per-activator-process state: correct only when a single
-	// activator replica serves this revision, since a pod discovered by one
-	// activator's endpoint watch may not be the one a request queued on a
-	// different activator is waiting for.
-
-	// Trackers that have been handed directly to a waiting request via
-	// queue but not yet returned through insertTracker. Excluded from
-	// assignedTrackers/capacity accounting while claimed. Guarded by mux.
-	claimedTrackers []*podTracker
-
-	// Trackers that must NOT be folded back into assignedTrackers once
-	// their claim completes, because their dest disappeared from a later
-	// backend update while still claimed by a waiter. Guarded by mux.
-	toDelete []*podTracker
-
-	// FIFO-ish queue (via non-blocking receive) of requests waiting for a
-	// new pod tracker (direct hand-off) or a clusterIP capacity broadcast,
-	// once both the revision breaker and the node fallback pool are
-	// exhausted.
-	queue chan *waiterEntry
+	// wakeMu guards wakeCh, which implements the wait-for-a-new-instance
+	// fallback (see wait/wakeAll below): it is closed to broadcast "capacity
+	// may have changed, worth re-checking" to every currently blocked wait()
+	// call, then replaced with a fresh channel, mirroring infiniteBreaker's
+	// broadcast/generation pattern. A waiter reads the current channel
+	// pointer and re-checks capacity immediately afterward, so a wakeAll
+	// that races with that check is never silently missed -- either the
+	// waiter's own recheck already sees the new state, or the close wakes
+	// it. This state is in-memory, per-activator-process: correct only when
+	// a single activator replica serves this revision, since a pod
+	// discovered by one activator's endpoint watch may not be the one a
+	// request waiting on a different activator needs.
+	wakeMu sync.Mutex
+	wakeCh chan struct{}
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
@@ -309,7 +291,7 @@ func newRevisionThrottler(revID types.NamespacedName,
 		lbPolicy:             lbp,
 		cr:                   cr,
 		nodePool:             nodePool,
-		queue:                make(chan *waiterEntry, breakerQueueDepth),
+		wakeCh:               make(chan struct{}),
 	}
 }
 
@@ -328,23 +310,55 @@ func (rt *revisionThrottler) acquireDest(ctx context.Context) (func(), *podTrack
 }
 
 func (rt *revisionThrottler) try(ctx context.Context, function func(string) error) error {
-	// Retrying infinitely as long as we receive no dest. Outer semaphore and inner
-	// pod capacity are not changed atomically, hence they can race each other. We
-	// "reenqueue" requests should that happen.
-	if release, err := rt.breaker.Reserve(ctx); err {
-		defer release()
-		cb, tracker := rt.acquireDest(ctx)
-		if tracker == nil {
-			// This can happen if individual requests raced each other or if pod
-			// capacity was decreased after passing the outer semaphore.
-			rt.logger.Fatalf("No tracker available for revision %s", rt.revID)
-			return nil
-		}
-		defer cb()
-		// We already reserved a guaranteed spot. So just execute the passed functor.
-		return function(tracker.dest)
+	if dest, done, ok := rt.tryBreaker(ctx); ok {
+		defer done()
+		return function(dest)
 	}
+	return rt.tryFallback(ctx, function)
+}
 
+// tryBreaker attempts the fast path: reserve a slot on the revision-wide
+// breaker and pick an assigned pod to dispatch to. Returns ok=false,
+// releasing any reservation it took along the way, if either step fails --
+// including the case where acquireDest finds no assigned tracker even
+// though Reserve succeeded (see comment below), which is a recoverable
+// condition, not an error.
+func (rt *revisionThrottler) tryBreaker(ctx context.Context) (dest string, done func(), ok bool) {
+	// Outer semaphore (the revision-wide breaker) and inner pod capacity
+	// (assignedTrackers) are not changed atomically, hence they can race
+	// each other -- see the tracker == nil case below.
+	release, reserved := rt.breaker.Reserve(ctx)
+	if !reserved {
+		return "", nil, false
+	}
+	cb, tracker := rt.acquireDest(ctx)
+	if tracker == nil {
+		// This can happen if individual requests raced each other or if pod
+		// capacity was decreased after passing the outer semaphore. Release
+		// our reservation; the caller falls back to the same cascade as if
+		// we'd failed to reserve in the first place, rather than treating
+		// this recoverable race as fatal.
+		release()
+		return "", nil, false
+	}
+	return tracker.dest, func() {
+		cb()
+		release()
+		// breaker.Reserve is a one-shot, non-blocking check (unlike
+		// Breaker.Maybe), so a request that failed to reserve falls
+		// straight through to the node-pool/wait fallback rather than
+		// blocking for a slot freed by this request's completion. Wake
+		// anyone parked in wait() now that our slot is free, so ordinary
+		// capacity turnover -- not just backend/pod events -- can also
+		// resolve requests waiting for capacity.
+		rt.wakeAll()
+	}, true
+}
+
+// tryFallback is reached once the fast path has no capacity: it kicks off
+// creation of a new instance, tries the CPU-share-bounded node pool, and
+// finally waits for a genuine new pod instance.
+func (rt *revisionThrottler) tryFallback(ctx context.Context, function func(string) error) error {
 	rt.logger.Debugf("Triggering creation of new instance for %s", rt.revID)
 	// We didn't manage to reserve a spot. Kick off the creation in background.
 	rt.cr.Poke()
@@ -361,34 +375,51 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 	return rt.wait(ctx, function)
 }
 
-// wait blocks until a new podTracker is created for this revision (or, in
-// clusterIP mode, until capacity is broadcast) and then dispatches to it.
+// wait blocks until the revision breaker has capacity again -- a new pod
+// appears, an existing one frees a slot, the activator's share of pods
+// changes, etc. -- retrying the same fast path a fresh request would use.
+//
+// This uses the same broadcast/generation pattern as infiniteBreaker
+// (below) rather than handing off a specific pod to a specific waiter:
+// every call to wakeAll (from tryBreaker's release, or from updateCapacity
+// on any backend/capacity change) closes the current wakeCh, waking every
+// goroutine blocked on it, and installs a fresh one. Reading wakeCh and
+// re-checking capacity happen back-to-back below, so a wakeAll racing with
+// that check is never silently missed -- either it lands before the
+// re-check (which then already sees the new state) or after (in which case
+// closing the channel wakes the select). An explicit hand-off queue was
+// tried here first and repeatedly proved racy under bursty load (a wake
+// fired before its intended recipient had even re-queued was simply lost);
+// this level-triggered design has no such window.
 func (rt *revisionThrottler) wait(ctx context.Context, function func(string) error) error {
-	w := &waiterEntry{ch: make(chan *podTracker, 1)}
-	rt.queue <- w
+	for {
+		rt.wakeMu.Lock()
+		ch := rt.wakeCh
+		rt.wakeMu.Unlock()
 
-	select {
-	case <-ctx.Done():
-		// If a producer already committed a tracker to w concurrently, we
-		// must still claim and return it -- otherwise its capacity would be
-		// permanently excluded from assignedTrackers (see reconcileClaimed).
-		if !w.taken.CompareAndSwap(false, true) {
-			if tracker := <-w.ch; tracker != nil {
-				rt.insertTracker(tracker)
-			}
+		if dest, done, ok := rt.tryBreaker(ctx); ok {
+			defer done()
+			return function(dest)
 		}
-		return ctx.Err()
 
-	case tracker := <-w.ch:
-		if tracker == nil {
-			// Broadcast wake (clusterIP capacity appeared): no specific
-			// tracker was handed to us, just retry from the top.
-			return rt.try(ctx, function)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ch:
+			// Capacity may have changed; loop around and recheck.
 		}
-		defer func() { rt.insertTracker(tracker) }()
-		rt.logger.Debugf("Forwarding to the new instance %s", tracker.dest)
-		return function(tracker.dest)
 	}
+}
+
+// wakeAll broadcasts to every currently blocked wait() call that capacity
+// may have changed and it's worth re-checking. See wait's doc comment.
+func (rt *revisionThrottler) wakeAll() {
+	rt.wakeMu.Lock()
+	defer rt.wakeMu.Unlock()
+	if rt.wakeCh != nil {
+		close(rt.wakeCh)
+	}
+	rt.wakeCh = make(chan struct{})
 }
 
 func (rt *revisionThrottler) calculateCapacity(backendCount, numTrackers, activatorCount int) int {
@@ -448,12 +479,6 @@ func (rt *revisionThrottler) updateCapacity(backendCount int) {
 
 		// We're using cluster IP.
 		if rt.clusterIPTracker != nil {
-			if backendCount > 0 {
-				// Capacity may now be available; wake any requests that were
-				// waiting on the node-quota/wait-queue fallback so they can
-				// retry rather than sit blocked until their context expires.
-				rt.broadcastWake()
-			}
 			return 0
 		}
 
@@ -462,34 +487,15 @@ func (rt *revisionThrottler) updateCapacity(backendCount int) {
 			return rt.podTrackers[i].dest < rt.podTrackers[j].dest
 		})
 
-		// The actual read of claimedTrackers and write out of the assigned
-		// trackers has to be under lock.
-		rt.mux.Lock()
-		defer rt.mux.Unlock()
-
-		candidates := rt.podTrackers
-		if len(rt.claimedTrackers) > 0 {
-			// Exclude trackers currently claimed by a waiting request --
-			// they aren't available for the normal LB path until the
-			// claiming request finishes and insertTracker returns them.
-			excluded := make(map[*podTracker]struct{}, len(rt.claimedTrackers))
-			for _, t := range rt.claimedTrackers {
-				excluded[t] = struct{}{}
-			}
-			candidates = make([]*podTracker, 0, len(rt.podTrackers))
-			for _, t := range rt.podTrackers {
-				if _, skip := excluded[t]; !skip {
-					candidates = append(candidates, t)
-				}
-			}
-		}
-
-		assigned := candidates
+		assigned := rt.podTrackers
 		if rt.containerConcurrency > 0 {
 			rt.resetTrackers()
-			assigned = assignSlice(candidates, ai, ac, rt.containerConcurrency)
+			assigned = assignSlice(rt.podTrackers, ai, ac, rt.containerConcurrency)
 		}
 		rt.logger.Debugf("Trackers %d/%d: assignment: %v", ai, ac, assigned)
+		// The actual write out of the assigned trackers has to be under lock.
+		rt.mux.Lock()
+		defer rt.mux.Unlock()
 		rt.assignedTrackers = assigned
 		return len(assigned)
 	}()
@@ -500,6 +506,17 @@ func (rt *revisionThrottler) updateCapacity(backendCount int) {
 
 	rt.backendCount = backendCount
 	rt.breaker.UpdateConcurrency(capacity)
+
+	if backendCount > 0 {
+		// Wake anyone parked in wait() -- capacity may have changed even
+		// though its cause wasn't necessarily a brand-new pod (e.g. an
+		// activator-count rebalance, or pods being removed and others
+		// picking up more of the assigned share). Without this, a request
+		// that fell into wait() during a burst that outpaced how fast new
+		// pods actually got created would stay blocked until its own
+		// context deadline even once the pod pool had spare capacity.
+		rt.wakeAll()
+	}
 }
 
 func (rt *revisionThrottler) updateThrottlerState(backendCount int, trackers []*podTracker, clusterIPDest *podTracker) {
@@ -524,104 +541,6 @@ func (rt *revisionThrottler) updateThrottlerState(backendCount int, trackers []*
 		// as though we have zero backends.
 		rt.updateCapacity(0)
 	}
-}
-
-// reconcileClaimed must be called from handleUpdate (single-threaded) with
-// the full new set of dests and the trackers that are genuinely new in this
-// update, before updateThrottlerState is called. It:
-//  1. hands each newly-added tracker directly to a currently-queued waiter
-//     (if any), recording it in claimedTrackers so updateCapacity excludes
-//     it from assignedTrackers until insertTracker returns it; and
-//  2. marks any currently-claimed tracker whose dest disappeared from this
-//     update as toDelete, so insertTracker won't resurrect it later.
-func (rt *revisionThrottler) reconcileClaimed(dests sets.Set[string], added []*podTracker) {
-	rt.mux.Lock()
-	for _, t := range rt.claimedTrackers {
-		if !dests.Has(t.dest) {
-			rt.toDelete = append(rt.toDelete, t)
-		}
-	}
-	rt.mux.Unlock()
-
-	for _, t := range added {
-		for {
-			select {
-			case w := <-rt.queue:
-				if !w.taken.CompareAndSwap(false, true) {
-					// Waiter already gave up (ctx cancelled); drop this dead
-					// entry and try the next queued waiter for tracker t.
-					continue
-				}
-				w.ch <- t // buffered 1, single writer, never blocks
-				rt.mux.Lock()
-				rt.claimedTrackers = append(rt.claimedTrackers, t)
-				rt.mux.Unlock()
-			default:
-				// No (more) waiters; leave t for the normal LB path.
-			}
-			break
-		}
-	}
-}
-
-// broadcastWake drains rt.queue and wakes every currently-queued waiter with
-// a nil payload, meaning "retry try() from the top" rather than a specific
-// tracker hand-off. Used only for clusterIP mode, where there is a single
-// shared dest (not individually exclusive pod trackers), so the exclusive
-// hand-off used for direct pod routing doesn't apply.
-func (rt *revisionThrottler) broadcastWake() {
-	for {
-		select {
-		case w := <-rt.queue:
-			if w.taken.CompareAndSwap(false, true) {
-				w.ch <- nil
-			}
-			// else: dead entry (waiter already cancelled); just drop it.
-		default:
-			return
-		}
-	}
-}
-
-// insertTracker folds a pod tracker that was claimed directly by a waiting
-// request back into the normal pool once that request completes, unless the
-// pod has since been removed (toDelete).
-func (rt *revisionThrottler) insertTracker(tracker *podTracker) {
-	rt.mux.Lock()
-	defer rt.mux.Unlock()
-
-	rt.claimedTrackers = removePodTracker(rt.claimedTrackers, tracker)
-	if idx := indexOfPodTracker(rt.toDelete, tracker); idx >= 0 {
-		rt.toDelete = append(rt.toDelete[:idx], rt.toDelete[idx+1:]...)
-		rt.logger.Debugf("Tracker %s was removed while claimed, not reinstating", tracker.dest)
-		return
-	}
-	// Fold the tracker directly into the LB pool under lock so subsequent
-	// requests can use it immediately. We deliberately do NOT call the full
-	// updateCapacity here: it's documented as safe only when invoked from
-	// the single throttler goroutine (it does unlocked sort/reset work),
-	// whereas insertTracker runs on arbitrary request goroutines. The
-	// revision breaker's overall capacity accounting for this tracker
-	// catches up on the next backend update instead.
-	rt.assignedTrackers = append(rt.assignedTrackers, tracker)
-}
-
-func removePodTracker(trackers []*podTracker, tracker *podTracker) []*podTracker {
-	for i, t := range trackers {
-		if t == tracker {
-			return append(trackers[:i], trackers[i+1:]...)
-		}
-	}
-	return trackers
-}
-
-func indexOfPodTracker(trackers []*podTracker, tracker *podTracker) int {
-	for i, t := range trackers {
-		if t == tracker {
-			return i
-		}
-	}
-	return -1
 }
 
 // pickIndices picks the indices for the slicing.
@@ -693,7 +612,6 @@ func (rt *revisionThrottler) handleUpdate(update revisionDestsUpdate) {
 		}
 
 		trackers := make([]*podTracker, 0, len(update.Dests))
-		added := make([]*podTracker, 0, len(update.Dests))
 
 		// Loop over dests, reuse existing tracker if we have one, otherwise create
 		// a new one.
@@ -709,15 +627,9 @@ func (rt *revisionThrottler) handleUpdate(update revisionDestsUpdate) {
 						InitialCapacity: rt.containerConcurrency, // Presume full unused capacity.
 					}))
 				}
-				added = append(added, tracker)
 			}
 			trackers = append(trackers, tracker)
 		}
-
-		// Hand genuinely-new trackers directly to any requests already
-		// waiting for a new instance, before they flow into the normal
-		// assignedTrackers/LB pool below.
-		rt.reconcileClaimed(update.Dests, added)
 
 		rt.updateThrottlerState(len(update.Dests), trackers, nil /*clusterIP*/)
 		return

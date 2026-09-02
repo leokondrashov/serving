@@ -224,6 +224,7 @@ func TestThrottlerUpdateCapacity(t *testing.T) {
 				logger:               logger,
 				breaker:              queue.NewBreaker(testBreakerParams),
 				containerConcurrency: tt.containerConcurrency,
+				wakeCh:               make(chan struct{}),
 			}
 			rt.numActivators.Store(tt.numActivators)
 			rt.activatorIndex.Store(tt.activatorIndex)
@@ -268,6 +269,7 @@ func TestThrottlerCalculateCapacity(t *testing.T) {
 				logger:               logger,
 				breaker:              newInfiniteBreaker(logger),
 				containerConcurrency: tt.containerConcurrency,
+				wakeCh:               make(chan struct{}),
 			}
 			rt.numActivators.Store(tt.numActivators)
 			// shouldn't really happen since revisionMaxConcurrency is very, very large,
@@ -912,6 +914,74 @@ func TestInfiniteBreakerCreation(t *testing.T) {
 		pkgnet.ServicePortNameHTTP1, queue.BreakerParams{}, TestLogger(t), newTestConcurrencyReporter(ctx), newNodePool(nil))
 	if _, ok := tttl.breaker.(*infiniteBreaker); !ok {
 		t.Errorf("The type of revisionBreaker = %T, want %T", tttl, (*infiniteBreaker)(nil))
+	}
+}
+
+// TestWaitQueueStragglersGetWokenByLaterUpdate reproduces a scenario where a
+// burst of requests exceeds the number of pods created to service the first
+// batch: more requests enter wait() than there are genuinely-new trackers in
+// a single handleUpdate, so reconcileClaimed can only hand off some of them
+// 1:1. Regression test for a bug where the leftover ("straggler") waiters
+// were never woken by anything else and blocked until their own context
+// deadline, even once the normal pod pool had plenty of spare capacity.
+func TestWaitStragglersGetWokenByLaterUpdate(t *testing.T) {
+	ctx, cancel, _ := rtesting.SetupFakeContextWithCancel(t)
+	defer cancel()
+
+	logger := TestLogger(t)
+	revName := types.NamespacedName{Namespace: testNamespace, Name: testRevision}
+	rt := newRevisionThrottler(revName, 10, /*cc*/
+		pkgnet.ServicePortNameHTTP1,
+		queue.BreakerParams{QueueDepth: 50, MaxConcurrency: revisionMaxConcurrency, InitialCapacity: 0},
+		logger, newTestConcurrencyReporter(ctx), newNodePool(nil) /*no node fallback capacity*/)
+
+	const numRequests = 50
+	results := make(chan error, numRequests)
+	var launched sync.WaitGroup
+	launched.Add(numRequests)
+	for i := 0; i < numRequests; i++ {
+		go func() {
+			reqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			launched.Done()
+			results <- rt.try(reqCtx, func(string) error { return nil })
+		}()
+	}
+	launched.Wait()
+	// The fast path (breaker.Reserve + nodePool.tryReserve, both with zero
+	// capacity here) fails synchronously and near-instantly, so by the time
+	// every goroutine has started it's at most a few scheduler ticks away
+	// from blocking in wait(). A short buffer is enough for all of them to
+	// get there before the update below fires.
+	time.Sleep(50 * time.Millisecond)
+
+	// First update creates fewer pods (2) than there are waiters (50): most
+	// requests won't be resolved by this update alone.
+	rt.handleUpdate(revisionDestsUpdate{
+		Rev:   revName,
+		Dests: sets.New("10.0.0.1:1234", "10.0.0.2:1234"),
+	})
+
+	// A later update with no new dests (e.g. an unrelated activator-count
+	// change) must still give every remaining waiter a chance to retry --
+	// by now the pod pool has spare capacity (2 pods * cc=10 = 20) to serve
+	// more of them, and each completion's wake-up should cascade through
+	// the rest.
+	rt.handleUpdate(revisionDestsUpdate{
+		Rev:   revName,
+		Dests: sets.New("10.0.0.1:1234", "10.0.0.2:1234"),
+	})
+
+	for i := 0; i < numRequests; i++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Errorf("try() #%d returned error %v, want nil", i, err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for try() results; %d/%d completed -- stragglers were never woken (assigned=%d, breakerCap=%d)",
+				i, numRequests, len(rt.assignedTrackers), rt.breaker.Capacity())
+		}
 	}
 }
 
