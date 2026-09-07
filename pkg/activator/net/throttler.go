@@ -704,8 +704,13 @@ func NewThrottler(ctx context.Context, ipAddr string, cr *handler.ConcurrencyRep
 	return t
 }
 
-// getNodes lists eligible worker nodes and computes each one's fallback
-// dispatch concurrency limit as floor(allocatable cores * cpuShare).
+// getNodes lists eligible worker nodes and distributes the cluster's total
+// fallback dispatch concurrency -- floor(total allocatable cores * cpuShare)
+// -- across them as equally as possible. Flooring per-node (as opposed to
+// once, over the cluster total) collapses many distinct cpuShare values onto
+// the same per-node limit, e.g. a 4-core node floors both 0.20 and 0.30 down
+// to the same value; computing the total once and spreading the remainder
+// preserves that resolution.
 func getNodes(ctx context.Context, cpuShare float64) []*nodeTracker {
 	logger := logging.FromContext(ctx)
 	restConfig, err := rest.InClusterConfig()
@@ -725,6 +730,7 @@ func getNodes(ctx context.Context, cpuShare float64) []*nodeTracker {
 	}
 
 	nodes := []*nodeTracker{}
+	var totalCores int64
 	for _, n := range nodeList.Items {
 		if n.Labels["loader-nodetype"] != "worker" && n.Labels["loader-nodetype"] != "singlenode" {
 			continue
@@ -739,8 +745,22 @@ func getNodes(ctx context.Context, cpuShare float64) []*nodeTracker {
 		}
 
 		cores := n.Status.Allocatable.Cpu().Value()
-		limit := int32(float64(cores) * cpuShare)
-		nodes = append(nodes, &nodeTracker{ip: ip, limit: limit})
+		totalCores += cores
+		nodes = append(nodes, &nodeTracker{ip: ip})
+	}
+
+	// Spread the cluster-wide total as equally as possible: every node gets
+	// at least base, and the first remainder nodes get one extra each.
+	if len(nodes) > 0 {
+		total := int32(float64(totalCores) * cpuShare)
+		base := total / int32(len(nodes))
+		remainder := total % int32(len(nodes))
+		for i, node := range nodes {
+			node.limit = base
+			if int32(i) < remainder {
+				node.limit++
+			}
+		}
 	}
 
 	logger.Infof("Nodes: %v", nodes)

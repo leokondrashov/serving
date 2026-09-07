@@ -204,8 +204,13 @@ func (cr *ConcurrencyReporter) report(now time.Time) []asmetrics.StatMessage {
 }
 
 func (cr *ConcurrencyReporter) computeReport(now time.Time) (msgs []asmetrics.StatMessage, toDelete []types.NamespacedName) {
-	cr.mux.RLock()
-	defer cr.mux.RUnlock()
+	// Full Lock, not RLock: this mutates each stat's firstRequest field
+	// below, and report() (below) is now reachable concurrently from many
+	// request goroutines via EnsureAccounted's Poke, not just the single
+	// ticker-driven caller, so concurrent RLock holders would race on that
+	// write.
+	cr.mux.Lock()
+	defer cr.mux.Unlock()
 	msgs = make([]asmetrics.StatMessage, 0, len(cr.stats))
 	for key, stat := range cr.stats {
 		report := stat.stats.Report(now)
@@ -345,7 +350,14 @@ func (cr *ConcurrencyReporter) EnsureAccounted(ctx context.Context, key types.Na
 
 	// Report with the freshly updated concurrency so the autoscaler actually
 	// learns about this request's demand and creates an instance for it.
-	cr.Poke()
+	// Poke sends on the (unbuffered, in production) stat channel, so this
+	// must not be done synchronously here: a burst of requests hitting this
+	// same fallback path -- exactly the case we're handling -- would then
+	// serialize on that send, each one blocking the rest, reintroducing the
+	// same request pile-up this whole fallback path exists to avoid. Losing
+	// a race for a slow consumer is fine: the stat we just recorded above
+	// still goes out on the next periodic report a second later regardless.
+	go cr.Poke()
 
 	return release
 }
