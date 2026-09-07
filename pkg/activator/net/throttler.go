@@ -34,11 +34,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
 	pkgnet "knative.dev/networking/pkg/apis/networking"
 	netcfg "knative.dev/networking/pkg/config"
+	kubeclient "knative.dev/pkg/client/injection/kube/client"
 	endpointsinformer "knative.dev/pkg/client/injection/kube/informers/core/v1/endpoints"
 	"knative.dev/pkg/controller"
 	"knative.dev/pkg/kmeta"
@@ -671,14 +671,24 @@ func NewThrottler(ctx context.Context, ipAddr string, cr *handler.ConcurrencyRep
 		cpuShare = 1.0
 	}
 
+	logger := logging.FromContext(ctx)
+	clientset := kubeclient.Get(ctx)
+	nodes, err := listWorkerNodes(ctx, clientset)
+	if err != nil {
+		logger.Fatalf("Error getting node list: %s\n", err.Error())
+	}
+	logger.Infof("Nodes: %v", nodes)
+
+	reconcileReservations(ctx, clientset, desiredReservations(nodes, cpuShare))
+
 	t := &Throttler{
 		revisionThrottlers: make(map[types.NamespacedName]*revisionThrottler),
 		revisionLister:     revisionInformer.Lister(),
 		ipAddress:          ipAddr,
-		logger:             logging.FromContext(ctx),
+		logger:             logger,
 		epsUpdateCh:        make(chan *corev1.Endpoints),
 		cr:                 cr,
-		nodePool:           newNodePool(getNodes(ctx, cpuShare)),
+		nodePool:           newNodePool(buildNodeTrackers(nodes, cpuShare)),
 	}
 
 	// Watch revisions to create throttler with backlog immediately and delete
@@ -704,33 +714,31 @@ func NewThrottler(ctx context.Context, ipAddr string, cr *handler.ConcurrencyRep
 	return t
 }
 
-// getNodes lists eligible worker nodes and distributes the cluster's total
-// fallback dispatch concurrency -- floor(total allocatable cores * cpuShare)
-// -- across them as equally as possible. Flooring per-node (as opposed to
-// once, over the cluster total) collapses many distinct cpuShare values onto
-// the same per-node limit, e.g. a 4-core node floors both 0.20 and 0.30 down
-// to the same value; computing the total once and spreading the remainder
-// preserves that resolution.
-func getNodes(ctx context.Context, cpuShare float64) []*nodeTracker {
-	logger := logging.FromContext(ctx)
-	restConfig, err := rest.InClusterConfig()
+// nodeInfo is the raw per-node data read once from the Kubernetes API at
+// startup. It is projected into two independent derived shapes:
+// buildNodeTrackers (the in-memory fallback-dispatch limit, where
+// cpuShare==1.0 means "uncapped") and desiredReservations (the
+// kube-scheduler-visible reservation, where cpuShare==1.0 means "reserve
+// nothing"). These are deliberately not the same number.
+type nodeInfo struct {
+	name  string
+	ip    string
+	cores int64
+}
+
+func (n nodeInfo) String() string {
+	return fmt.Sprintf("%s(%s, cores=%d)", n.name, n.ip, n.cores)
+}
+
+// listWorkerNodes lists the nodes eligible for escrow fallback dispatch and
+// capacity reservation: those labeled loader-nodetype=worker or singlenode.
+func listWorkerNodes(ctx context.Context, clientset kubernetes.Interface) ([]nodeInfo, error) {
+	nodeList, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		logger.Fatalf("Error building in-cluster config: %s\n", err.Error())
+		return nil, err
 	}
 
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		logger.Fatalf("Error creating clientset: %s\n", err.Error())
-	}
-
-	// Get the node list
-	nodeList, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		logger.Fatalf("Error getting node list: %s\n", err.Error())
-	}
-
-	nodes := []*nodeTracker{}
-	var totalCores int64
+	nodes := make([]nodeInfo, 0, len(nodeList.Items))
 	for _, n := range nodeList.Items {
 		if n.Labels["loader-nodetype"] != "worker" && n.Labels["loader-nodetype"] != "singlenode" {
 			continue
@@ -744,27 +752,68 @@ func getNodes(ctx context.Context, cpuShare float64) []*nodeTracker {
 			}
 		}
 
-		cores := n.Status.Allocatable.Cpu().Value()
-		totalCores += cores
-		nodes = append(nodes, &nodeTracker{ip: ip})
+		nodes = append(nodes, nodeInfo{
+			name:  n.Name,
+			ip:    ip,
+			cores: n.Status.Allocatable.Cpu().Value(),
+		})
+	}
+	return nodes, nil
+}
+
+// buildNodeTrackers distributes the cluster's total fallback dispatch
+// concurrency -- floor(total allocatable cores * cpuShare) -- across nodes
+// as equally as possible. Flooring per-node (as opposed to once, over the
+// cluster total) collapses many distinct cpuShare values onto the same
+// per-node limit, e.g. a 4-core node floors both 0.20 and 0.30 down to the
+// same value; computing the total once and spreading the remainder
+// preserves that resolution.
+func buildNodeTrackers(nodes []nodeInfo, cpuShare float64) []*nodeTracker {
+	trackers := make([]*nodeTracker, len(nodes))
+	for i, n := range nodes {
+		trackers[i] = &nodeTracker{ip: n.ip}
 	}
 
 	// Spread the cluster-wide total as equally as possible: every node gets
 	// at least base, and the first remainder nodes get one extra each.
-	if len(nodes) > 0 {
+	if len(trackers) > 0 {
+		var totalCores int64
+		for _, n := range nodes {
+			totalCores += n.cores
+		}
 		total := int32(float64(totalCores) * cpuShare)
-		base := total / int32(len(nodes))
-		remainder := total % int32(len(nodes))
-		for i, node := range nodes {
-			node.limit = base
+		base := total / int32(len(trackers))
+		remainder := total % int32(len(trackers))
+		for i, tracker := range trackers {
+			tracker.limit = base
 			if int32(i) < remainder {
-				node.limit++
+				tracker.limit++
 			}
 		}
 	}
 
-	logger.Infof("Nodes: %v", nodes)
-	return nodes
+	return trackers
+}
+
+// desiredReservations computes, for each worker node, the whole-core CPU
+// quantity that should be reserved via a placeholder Pod so kube-scheduler
+// treats it as unavailable to other pods. Deliberately diverges from
+// buildNodeTrackers' semantics: cpuShare==1.0 (unset/default) means "reserve
+// nothing" here, NOT "reserve the whole node" -- 1.0 is the legacy default
+// and must not newly start blocking scheduling on every worker node just
+// because this feature wasn't deliberately configured.
+func desiredReservations(nodes []nodeInfo, cpuShare float64) map[string]int32 {
+	desired := make(map[string]int32, len(nodes))
+	if cpuShare == 1.0 {
+		for _, n := range nodes {
+			desired[n.name] = 0
+		}
+		return desired
+	}
+	for _, n := range nodes {
+		desired[n.name] = int32(float64(n.cores) * cpuShare)
+	}
+	return desired
 }
 
 // Run starts the throttler and blocks until the context is done.
