@@ -360,8 +360,14 @@ func (rt *revisionThrottler) tryBreaker(ctx context.Context) (dest string, done 
 // finally waits for a genuine new pod instance.
 func (rt *revisionThrottler) tryFallback(ctx context.Context, function func(string) error) error {
 	rt.logger.Debugf("Triggering creation of new instance for %s", rt.revID)
-	// We didn't manage to reserve a spot. Kick off the creation in background.
-	rt.cr.Poke()
+	// We didn't manage to reserve a spot. Make sure this request's demand is
+	// visible to the autoscaler -- the IAT filter upstream may not have
+	// counted it -- and kick off creation in background. Keep it accounted
+	// for as long as this request is stuck in the fallback path, so a
+	// request parked in wait() below keeps looking like real demand for as
+	// long as it's actually waiting.
+	release := rt.cr.EnsureAccounted(ctx, rt.revID)
+	defer release()
 
 	// Local expansion: dispatch directly to a worker node's relay, bounded
 	// by that node's CPU-share quota.

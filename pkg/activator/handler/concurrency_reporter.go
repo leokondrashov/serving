@@ -42,6 +42,22 @@ import (
 
 const reportInterval = time.Second
 
+// accountedKey marks, on the request context, that this request's
+// concurrency has already been recorded by Handler's IAT-filtered
+// instrumentation below. It lets the throttler's fallback path (see
+// EnsureAccounted) tell whether it still needs to account for the request
+// itself, instead of double-counting it.
+type accountedKey struct{}
+
+func withAccounted(ctx context.Context) context.Context {
+	return context.WithValue(ctx, accountedKey{}, true)
+}
+
+func isAccounted(ctx context.Context) bool {
+	accounted, _ := ctx.Value(accountedKey{}).(bool)
+	return accounted
+}
+
 // revisionStats is a type that wraps information needed to calculate stats per revision.
 //
 // stats is thread-safe in itself and thus needs no extra synchronization.
@@ -281,6 +297,7 @@ func (cr *ConcurrencyReporter) Handler(next http.Handler) http.HandlerFunc {
 			defer func() {
 				cr.handleRequestOut(stat, netstats.ReqEvent{Key: revisionKey, Type: netstats.ReqOut, Time: time.Now()})
 			}()
+			r = r.WithContext(withAccounted(r.Context()))
 		}
 		cr.mux.Lock()
 		if !ok {
@@ -301,4 +318,34 @@ func (cr *ConcurrencyReporter) Poke() {
 	if len(msgs) > 0 {
 		cr.statCh <- msgs
 	}
+}
+
+// EnsureAccounted makes sure a request that is about to fall back to the
+// node-pool/wait path is actually visible to the autoscaler. The IAT filter
+// in Handler above may have chosen not to record this request's concurrency
+// (e.g. it hasn't seen a fast enough succession of requests yet), in which
+// case the demand behind a fallback request would otherwise never show up
+// in a report -- leaving it to wait for an instance the autoscaler has no
+// reason to create. If the request was already accounted for by Handler,
+// this is a no-op beyond the poke, since the pending increment/decrement
+// pair already spans the request's lifetime and re-recording it here would
+// double count it.
+//
+// It returns a release func that must be called exactly once, when the
+// fallback path is done with the request (regardless of which branch of it
+// actually served the request), to keep the increment/decrement balanced.
+func (cr *ConcurrencyReporter) EnsureAccounted(ctx context.Context, key types.NamespacedName) func() {
+	release := func() {}
+	if !isAccounted(ctx) {
+		stat := cr.handleRequestIn(netstats.ReqEvent{Key: key, Type: netstats.ReqIn, Time: time.Now()})
+		release = func() {
+			cr.handleRequestOut(stat, netstats.ReqEvent{Key: key, Type: netstats.ReqOut, Time: time.Now()})
+		}
+	}
+
+	// Report with the freshly updated concurrency so the autoscaler actually
+	// learns about this request's demand and creates an instance for it.
+	cr.Poke()
+
+	return release
 }
