@@ -679,7 +679,12 @@ func NewThrottler(ctx context.Context, ipAddr string, cr *handler.ConcurrencyRep
 	}
 	logger.Infof("Nodes: %v", nodes)
 
-	reconcileReservations(ctx, clientset, desiredReservations(nodes, cpuShare))
+	trackers := buildNodeTrackers(nodes, cpuShare)
+	logger.Infof("Fallback dispatch limits (cpuShare=%v): %v", cpuShare, trackers)
+
+	reservations := desiredReservations(nodes, cpuShare, trackers)
+	logger.Infof("Escrow reservation targets (cpuShare=%v): %v", cpuShare, reservations)
+	reconcileReservations(ctx, clientset, reservations)
 
 	t := &Throttler{
 		revisionThrottlers: make(map[types.NamespacedName]*revisionThrottler),
@@ -688,7 +693,7 @@ func NewThrottler(ctx context.Context, ipAddr string, cr *handler.ConcurrencyRep
 		logger:             logger,
 		epsUpdateCh:        make(chan *corev1.Endpoints),
 		cr:                 cr,
-		nodePool:           newNodePool(buildNodeTrackers(nodes, cpuShare)),
+		nodePool:           newNodePool(trackers),
 	}
 
 	// Watch revisions to create throttler with backlog immediately and delete
@@ -797,21 +802,29 @@ func buildNodeTrackers(nodes []nodeInfo, cpuShare float64) []*nodeTracker {
 
 // desiredReservations computes, for each worker node, the whole-core CPU
 // quantity that should be reserved via a placeholder Pod so kube-scheduler
-// treats it as unavailable to other pods. Deliberately diverges from
-// buildNodeTrackers' semantics: cpuShare==1.0 (unset/default) means "reserve
-// nothing" here, NOT "reserve the whole node" -- 1.0 is the legacy default
-// and must not newly start blocking scheduling on every worker node just
-// because this feature wasn't deliberately configured.
-func desiredReservations(nodes []nodeInfo, cpuShare float64) map[string]int32 {
+// treats it as unavailable to other pods. trackers must be the result of
+// buildNodeTrackers(nodes, cpuShare) for the same nodes/cpuShare -- the
+// escrow reservation and the in-memory fallback-dispatch limit are the same
+// reserved capacity, just communicated to two different consumers, so this
+// reuses trackers' per-node limit (the cluster-wide-total-then-remainder
+// spread) rather than re-deriving it. Re-flooring per node independently
+// here would collapse small cpuShare values to 0 on every node even when
+// the cluster-wide total is nonzero -- exactly the resolution loss
+// buildNodeTrackers' own spread avoids.
+//
+// The one deliberate divergence: cpuShare==1.0 (unset/default) means
+// "reserve nothing" here, NOT "reserve floor(cores*1.0) per node" (i.e.
+// every core on every node) -- 1.0 is the legacy default and must not newly
+// start blocking scheduling on every worker node just because this feature
+// wasn't deliberately configured.
+func desiredReservations(nodes []nodeInfo, cpuShare float64, trackers []*nodeTracker) map[string]int32 {
 	desired := make(map[string]int32, len(nodes))
-	if cpuShare == 1.0 {
-		for _, n := range nodes {
+	for i, n := range nodes {
+		if cpuShare == 1.0 {
 			desired[n.name] = 0
+			continue
 		}
-		return desired
-	}
-	for _, n := range nodes {
-		desired[n.name] = int32(float64(n.cores) * cpuShare)
+		desired[n.name] = trackers[i].limit
 	}
 	return desired
 }

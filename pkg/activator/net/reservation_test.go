@@ -46,9 +46,12 @@ func TestDesiredReservations(t *testing.T) {
 		cpuShare: 1.0,
 		want:     map[string]int32{"node-a": 0, "node-b": 0},
 	}, {
-		name:     "fractional share reserves a floor of each node's cores",
+		// Cluster-wide total: floor((4+8)*0.5) = 6, spread evenly (base=3,
+		// remainder=0) across both nodes -- NOT floor(cores*0.5) per node
+		// (which would give 2/4 and is the bug this mirrors trackers to fix).
+		name:     "fractional share reserves the cluster-wide total, spread like buildNodeTrackers",
 		cpuShare: 0.5,
-		want:     map[string]int32{"node-a": 2, "node-b": 4},
+		want:     map[string]int32{"node-a": 3, "node-b": 3},
 	}, {
 		name:     "zero share reserves nothing",
 		cpuShare: 0,
@@ -57,11 +60,43 @@ func TestDesiredReservations(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := desiredReservations(nodes, tc.cpuShare)
+			trackers := buildNodeTrackers(nodes, tc.cpuShare)
+			got := desiredReservations(nodes, tc.cpuShare, trackers)
 			if diff := cmp.Diff(tc.want, got); diff != "" {
 				t.Errorf("desiredReservations() mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// TestDesiredReservationsMatchesClusterWideSpread is a regression test: a
+// small cpuShare must not floor to 0 on every node just because it floors to
+// 0 *per node*. desiredReservations must mirror buildNodeTrackers' cluster-
+// wide-total-then-remainder spread, not re-floor independently per node.
+func TestDesiredReservationsMatchesClusterWideSpread(t *testing.T) {
+	// 6 nodes x 20 cores = 120 total. cpuShare=0.025 -> floor(120*0.025) = 3,
+	// spread across 6 nodes as 1,1,1,0,0,0 -- matching the observed bug
+	// report exactly. Flooring per node instead (floor(20*0.025)=floor(0.5))
+	// would wrongly produce all zeros.
+	nodes := make([]nodeInfo, 6)
+	for i := range nodes {
+		nodes[i] = nodeInfo{name: string(rune('a' + i)), cores: 20}
+	}
+	const cpuShare = 0.025
+
+	trackers := buildNodeTrackers(nodes, cpuShare)
+	got := desiredReservations(nodes, cpuShare, trackers)
+
+	want := map[string]int32{"a": 1, "b": 1, "c": 1, "d": 0, "e": 0, "f": 0}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("desiredReservations() mismatch (-want +got):\n%s", diff)
+	}
+
+	// It must also equal trackers' own limits exactly, node for node.
+	for i, n := range nodes {
+		if got[n.name] != trackers[i].limit {
+			t.Errorf("desiredReservations()[%s] = %d, want it to match nodeTracker.limit = %d", n.name, got[n.name], trackers[i].limit)
+		}
 	}
 }
 
@@ -181,6 +216,29 @@ func TestReconcileReservations(t *testing.T) {
 	}
 	if len(podsAgain.Items) != len(pods.Items) {
 		t.Errorf("re-reconciling with unchanged desired state changed pod count: got %d, want %d", len(podsAgain.Items), len(pods.Items))
+	}
+
+	// Regression test: a *second* non-zero -> non-zero change (2 -> 5) must
+	// also take effect. This is exactly the scenario that used to silently
+	// fail on a real cluster: delete+recreate under the same Pod name races
+	// the old Pod's actual termination (it lingers Terminating rather than
+	// disappearing synchronously), so Create would hit AlreadyExists against
+	// the still-present old-value Pod and the swallowed error masked a
+	// no-op. Encoding cores into the Pod name avoids the race entirely.
+	desired["changed-node"] = 5
+	reconcileReservations(ctx, fake, desired)
+	podsFinal, err := fake.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list pods: %v", err)
+	}
+	byNodeFinal := map[string]corev1.Pod{}
+	for _, p := range podsFinal.Items {
+		byNodeFinal[p.Labels[reservationNodeLabelKey]] = p
+	}
+	if pod, ok := byNodeFinal["changed-node"]; !ok {
+		t.Error("expected changed-node to still have a reservation pod after a second non-zero change")
+	} else if got := requestedCores(pod); got != 5 {
+		t.Errorf("changed-node reservation cpu after second change = %d, want 5", got)
 	}
 }
 

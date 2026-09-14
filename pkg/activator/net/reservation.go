@@ -18,6 +18,7 @@ package net
 
 import (
 	"context"
+	"strconv"
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
@@ -48,17 +49,31 @@ const (
 	reservationImage = "registry.k8s.io/pause:3.9"
 )
 
+// reservationPodName is deterministic from both the node name and the
+// desired core count -- NOT just the node name. A Pod's requests.cpu is
+// immutable, and a real Delete doesn't remove the object synchronously (it
+// lingers Terminating until the kubelet on that node acknowledges it, which
+// can take up to its terminationGracePeriodSeconds). Encoding cores into the
+// name means "go from 2 cores to 4 cores" creates a *different* object
+// instead of racing the old one's deletion: Create either succeeds outright
+// or, if a previous reconcile already got there, returns AlreadyExists --
+// both are the correct end state, with no dependency on how fast the old
+// (differently-named) Pod actually finishes terminating.
+func reservationPodName(nodeName string, cores int32) string {
+	return kmeta.ChildName("escrow-reservation", "-"+nodeName+"-"+strconv.Itoa(int(cores)))
+}
+
 // reconcileReservations idempotently syncs one placeholder Pod per node in
 // desired (keyed by node name, valued by whole cores to reserve) so that
 // kube-scheduler treats that CPU quantity as unavailable to any other pod on
 // the node. A desired value of 0 means "reserve nothing on this node" (see
-// desiredReservations) and any existing reservation Pod there is removed.
-// Nodes no longer present in desired at all (label removed, node deleted)
-// are also garbage collected.
+// desiredReservations) and any existing reservation Pod(s) there are
+// removed. Nodes no longer present in desired at all (label removed, node
+// deleted) are also garbage collected.
 //
 // This is called independently, at startup, by every activator replica --
-// not by a single leader. It is idempotent and safe to race: reservation
-// Pod names are deterministic from the node name, so concurrent replicas
+// not by a single leader. It is idempotent and safe to race: the Pod name
+// for a given (node, cores) pair is deterministic, so concurrent replicas
 // converge on the same object rather than creating duplicates. Every
 // mutation tolerates "someone else already got there first" as success.
 //
@@ -77,31 +92,51 @@ func reconcileReservations(ctx context.Context, clientset kubernetes.Interface, 
 		return
 	}
 
-	byNode := make(map[string]corev1.Pod, len(existing.Items))
+	// Group by node -- there can legitimately be more than one Pod per node
+	// at once transiently (e.g. an old value's Pod still Terminating after
+	// a previous reconcile moved it to a new name).
+	byNode := make(map[string][]corev1.Pod, len(existing.Items))
 	for _, p := range existing.Items {
-		byNode[p.Labels[reservationNodeLabelKey]] = p
+		node := p.Labels[reservationNodeLabelKey]
+		byNode[node] = append(byNode[node], p)
 	}
 
 	for nodeName, cores := range desired {
-		pod, have := byNode[nodeName]
+		podsForNode := byNode[nodeName]
 		delete(byNode, nodeName) // accounted for, whatever we do with it below
 
-		switch {
-		case cores <= 0 && have:
-			deleteReservationPod(ctx, pods, logger, pod.Name)
-		case cores > 0 && !have:
-			createReservationPod(ctx, pods, logger, nodeName, cores)
-		case cores > 0 && have && requestedCores(pod) != cores:
-			// requests.cpu is immutable: must delete+recreate, not update.
-			deleteReservationPod(ctx, pods, logger, pod.Name)
+		if cores <= 0 {
+			for _, p := range podsForNode {
+				deleteReservationPod(ctx, pods, logger, p.Name)
+			}
+			continue
+		}
+
+		wantName := reservationPodName(nodeName, cores)
+		haveWant := false
+		for _, p := range podsForNode {
+			if p.Name == wantName {
+				haveWant = true
+				continue
+			}
+			// Stale: reserves this node under a previous cores value (or a
+			// duplicate). Delete it -- harmless if it's already Terminating.
+			logger.Infof("Escrow reservation on node %s changed (pod %s no longer matches desired %d cores): deleting", nodeName, p.Name, cores)
+			deleteReservationPod(ctx, pods, logger, p.Name)
+		}
+		if !haveWant {
+			logger.Infof("Escrow reservation on node %s: creating %s requesting %d cores", nodeName, wantName, cores)
 			createReservationPod(ctx, pods, logger, nodeName, cores)
 		}
 	}
 
 	// Anything left in byNode belongs to a node no longer in the desired
 	// set at all -- garbage collect it.
-	for _, pod := range byNode {
-		deleteReservationPod(ctx, pods, logger, pod.Name)
+	for nodeName, podsForNode := range byNode {
+		for _, p := range podsForNode {
+			logger.Infof("Escrow reservation on node %s no longer desired: deleting %s", nodeName, p.Name)
+			deleteReservationPod(ctx, pods, logger, p.Name)
+		}
 	}
 }
 
@@ -117,7 +152,7 @@ func createReservationPod(ctx context.Context, pods corev1client.PodInterface, l
 	quantity := *resource.NewQuantity(int64(cores), resource.DecimalSI)
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      kmeta.ChildName("escrow-reservation", "-"+nodeName),
+			Name:      reservationPodName(nodeName, cores),
 			Namespace: system.Namespace(),
 			Labels: map[string]string{
 				reservationLabelKey:     "true",
